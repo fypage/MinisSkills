@@ -1,120 +1,111 @@
 ---
 name: image-generator
-description: Generate, test, and refine images from user prompts. Use when the user asks to 生成图片, 画图, 测试提示词, 跑图, 做海报, 做封面, 壁纸, 插画, generate an image, create a picture, test an image prompt, or turn an idea into an image. Supports prompt optimization, model/provider fallback, image-output extraction, and local Pillow fallback.
-version: 1.1.2
+description: >
+  Generate or edit images using OpenMinis built-in model-use with the user-configured image_output provider, especially 智画创 / WisArt gpt-image-2. Trigger whenever the user asks to “生图”, “画图”, “生成图片”, “文生图”, “改图”, “图生图”, “图片编辑”, “出一张图”, mentions WisArt, 智画创, gpt-image-2, or provides an image plus an edit instruction. The assistant calls the model directly, saves outputs to /var/minis/attachments, and displays the image with site/model/clarity/aspect/quality/elapsed/path metadata.
+version: 0.1
+compatibility: OpenMinis Android 0.18+; uses minis-model-use image_output. No environment variable or raw API key required when the provider/model is configured in the app.
 ---
-# Image Generator
+# OpenMinis Image Generator
 
-## Boundaries
+Generate or edit images through **OpenMinis `minis-model-use`**. The user only adds/enables an image model in OpenMinis settings; the assistant calls it directly. Do not ask for `WISART_API_KEY` or raw provider credentials.
 
-- Do the requested image task; do **not** create unrelated reusable API tools, environment-variable setup flows, or platform-agnostic CLIs unless the user explicitly asks.
-- If the user says “参考这个提示词/工作流”, extract useful patterns and improve this skill/workflow; do not blindly implement the referenced artifact.
-- Never print API keys, tokens, or environment variable values.
+## Quick Workflow
 
-## Default workflow
+1. Check available image models with `minis-model-use list --modality image_output` when unsure.
+2. Decide mode: text-to-image (`generate`) or image-to-image/edit (`edit`).
+3. Refine short user requests into a concrete visual prompt.
+4. Run `/var/minis/skills/image-generator/scripts/openminis_image.py`.
+5. Display the result inline with the metadata format below.
+6. If model-use times out but WisArt backend created the job, recover from the logged-in WisArt frontend jobs API.
 
-1. If the prompt/theme is clear, generate immediately. Ask only when missing details block execution.
-2. Prefer configured `image_output` models:
-   - Run `minis-model-use list` and choose an available image-output model.
-   - If duplicate model IDs exist, use `--provider <instance_label>` or the full entry id.
-   - Default image model preference: try the provider that recently worked first; if it fails, try the next image-output provider.
-3. Use common aspect-ratio defaults:
-   - Portrait / 竖版 / 9:16: `1024x1792`.
-   - Landscape / 横版 / 16:9: `1792x1024`.
-   - Square / default: `1024x1024`.
-4. Save final images under `/var/minis/attachments/` and embed inline with `![desc](minis://attachments/file.png)`.
-5. After generation, report briefly: model/provider or fallback method, size, saved path, and one useful refinement suggestion.
+## Script Usage
 
-## Model invocation pattern
+Text-to-image:
 
-Create a JSON input file in `/tmp` when `minis-model-use --input /var/minis/...` has path/offload issues.
-
-OpenAI-compatible image call shape:
-
-```json
-{"prompt":"...","size":"1024x1792","quality":"hd","n":1}
+```bash
+python3 /var/minis/skills/image-generator/scripts/openminis_image.py generate \
+  --prompt "未来城市日落，电影感，宽幅构图" \
+  --size 16:9 --resolution 1K --quality auto --n 1
 ```
 
-Notes:
+Image-to-image / edit:
 
-- Some providers return base64 inside Markdown data URLs, e.g. `![image](data:image/png;base64,...)`; extract and save to `/var/minis/attachments/`.
-- If one provider fails with account/model support errors, do not retry it repeatedly; switch provider.
-- If a provider times out once, one retry is reasonable; repeated timeouts should fall back or report clearly.
-- If `quality:"hd"` times out with HTTP 524, retry once with `quality:"standard"` or provider-specific `quality:"auto"` before giving up.
-
-## Provider notes
-
-- `Token能量站/gpt-image-2` has worked for direct `minis-model-use` image generation. Use it as the first fallback when another OpenAI-compatible image provider fails.
-- `picpi 皮皮工艺站/gpt-image-2` may fail with `Tool choice 'image_generation' not found in 'tools' parameter` or `The 'gpt-image-2' model is not supported when using Codex with a ChatGPT account.` This means the provider is routing generation through Codex `/responses` image tool or an unsupported ChatGPT/free account. Do not keep retrying; ask the user to switch the upstream channel/account to K12/Plus/Team or use another provider.
-- WisArt (`https://wisart.kuaileshifu.com`) exposes OpenAI-compatible image endpoints:
-  - `GET /v1/models`
-  - `POST /v1/images/generations`
-  - `POST /v1/images/edits`
-  - Auth header: `Authorization: Bearer sk-...`
-  - Generation body example: `{"model":"gpt-image-2","prompt":"...","size":"1200x675","quality":"auto","n":1,"response_format":"b64_json"}`.
-  - Supported sizes include `auto`, ratios like `1:1`, `16:9`, `9:16`, and explicit dimensions like `1024x1024`, `1200x675`, `928x1664`; `quality` supports `auto`, `low`, `medium`, `high`, `hd`.
-  - To add it to Minis, configure an OpenAI-compatible provider with custom base URL `https://wisart.kuaileshifu.com` and append `/v1` enabled, then use `gpt-image-2`.
-
-## Prompt handling
-
-Use the user's prompt as the source of truth. Do not rewrite the intent unless the user asks for prompt optimization or a technical change is required for the model call.
-
-Convert vague requests into a concrete visual brief only when needed:
-
-- Subject: main object/scene
-- Style: photo, anime, ink painting, cyberpunk, minimalist poster, 3D icon, etc.
-- Composition: close-up, wide shot, centered, rule of thirds, poster layout
-- Color/mood: warm, dark, neon, pastel, cinematic, elegant
-- Lighting/camera: softbox, window light, backlight, shallow depth of field, lens feel
-- Text: include exact text only when user asks; keep text short
-
-Portrait clarity rule:
-
-- Prompts containing `soft-focus`, `dreamy`, `overexposed`, `beauty filter`, `shallow depth of field`, or `pastel` can produce overly blurry faces. If the user complains that the image is blurry, keep the mood but add: `sharp facial details, crisp eyes and eyelashes, clear hair strands, detailed accessories, sharp focus on face, avoid excessive blur`, and add negatives like `out of focus face, smeared details, over-smoothed skin, blurry artifacts`.
-
-For long professional prompts, preserve structure but compress duplicates before sending to the model. Keep the visual hierarchy:
-
-1. aspect ratio + medium/style
-2. subject identity and age if relevant
-3. pose/composition
-4. face/skin/makeup/hair/clothing
-5. scene/background
-6. lighting/color/quality constraints
-7. negative constraints such as “not juvenile, not westernized, not plastic skin”
-
-Example expansion:
-
-User: `生成一张猫咪图片`
-Brief: `一只橘猫坐在窗台上，窗外雨夜霓虹，温暖室内灯光，电影感，柔和景深，1024x1024`.
-
-## Local Pillow fallback
-
-Use only when no working image-output model is available, or when the user asks for simple procedural graphics.
-
-```sh
-python3 /var/minis/skills/image-generator/scripts/procedural_image.py \
-  --prompt "极光夜景，湖面倒影，山脉剪影" \
-  --output /var/minis/attachments/aurora_night.png \
-  --size 1024x1024
+```bash
+python3 /var/minis/skills/image-generator/scripts/openminis_image.py edit \
+  --image /var/minis/attachments/input.png \
+  --prompt "保留人物身份和构图，改成赛博朋克雨夜风格" \
+  --size 9:16 --resolution 1K --quality auto --n 1
 ```
 
-If Python/Pillow is missing:
+For image-to-image, the wrapper compresses local reference images, converts them to data URI, and passes them as top-level `images: [data_uri]` through the normal generations channel. This is the format verified with WisArt through `minis-model-use`. Do not upload reference images to a VPS/public host.
 
-```sh
-apk add --no-cache python3 py3-pillow
-```
+## Parameters
 
-When using this fallback, clearly say it is a local procedural image, not an AI image-model result.
+| Parameter | Default | Notes |
+|---|---:|---|
+| `provider` | auto, prefer `智画创` | Uses the configured OpenMinis provider. |
+| `model` | auto, prefer `gpt-image-2` | Uses first available image_output model if preferred one is absent. |
+| `size` | `1200x675` | WisArt also accepts aspect ratios: `1:1`, `4:5`, `3:4`, `2:3`, `3:2`, `4:3`, `16:9`, `9:16`, `21:9`. |
+| `resolution` | `1K` | WisArt frontend clarity tier: `1K`, `2K`, `4K`. |
+| `quality` | `auto` | Compatibility field. Prefer `resolution` for clarity; use `medium`/`high` only when needed. |
+| `n` | `1` | Generate one first unless the user asks for more. |
+| `response_format` | `url` | Reduces large base64 timeout risk. |
 
-## Output response style
+## Output Format
 
-Keep the response short:
+After every successful generation, display exactly this style:
 
 ```md
-已生成：
+![生成图片]({minis_url})
 
-![描述](minis://attachments/file.png)
+### 生图信息
 
-方式：gpt-image-2 / Token能量站，1024x1792。  
-下一版建议：加强妆容水光或降低背景复杂度。
+站点：`{site}`  
+模型：`{model}`  
+清晰度：`{pixel_size}`  
+比例：`{aspect}`  
+质量：`quality={quality}`  
+耗时：`{elapsed}`  
+文件路径：`{path}`
 ```
+
+Rules:
+- `清晰度` is the actual output pixel dimensions read from the saved file, e.g. `941x1672` or `1672x941`.
+- `比例` is the actual/fallback aspect ratio, e.g. `9:16`, `16:9`, `1:1`.
+- Do not show a separate `张数` line by default.
+- Do not show a separate `1K/2K/4K` line by default; it is only an internal/request tier.
+- Do not add a copy block unless the user asks.
+
+## WisArt Timeout Recovery
+
+WisArt's OpenAI-compatible `/v1/images/generations` is synchronous and may time out while the backend job still succeeds. If `minis-model-use` returns errors such as `stream was reset: CANCEL`, `HTTP 502`, or `Client.Timeout or context cancellation while reading body`:
+
+1. Do not blindly retry multiple times.
+2. If logged into WisArt in the browser, open/query:
+   - `https://wisart.kuaileshifu.com/api/jobs?limit=8`
+3. Find the latest `status: success` job matching the prompt/model/size.
+4. Download its first output path, e.g. `https://wisart.kuaileshifu.com/outputs/jobs/.../01.png`.
+5. Copy the downloaded file to `/var/minis/attachments/` and display it with the normal metadata card.
+
+Useful WisArt frontend APIs:
+
+```txt
+GET /api/image-models   # model list, supported 1K/2K/4K, point costs
+GET /api/meta/enums     # job/failure/reference-mode enums
+GET /api/jobs?limit=8   # recent jobs and output paths
+```
+
+## Prompt Guidance
+
+- Prefer one strong prompt over repeated retries.
+- For edits: explicitly say what to keep and what to change.
+- For portraits: preserve identity, pose, clothing, facial structure, and gaze unless the user asks otherwise.
+- For product/logo/text images: specify exact text, layout, background, and color palette.
+- For UI/poster prompts: request clean typography, controlled hierarchy, and avoid unwanted phone/app screenshot artifacts when not desired.
+
+## Failure Handling
+
+- If no image_output model is available, ask the user to add/enable a生图模型 in `[Settings → Providers](minis://settings/providers)` or `[Settings → Model Groups](minis://settings/model-groups)`.
+- If output path is relative, retry with an absolute `/var/minis/attachments/...` path.
+- If WisArt backend shows success but local fetch timed out, recover from `/api/jobs` as above.
+- If the provider reports maintenance/unavailable, stop retrying and report it briefly.

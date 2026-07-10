@@ -1,0 +1,37 @@
+{
+  "skill_name": "image-generator",
+  "evals": [
+    {
+      "id": "text_to_image_basic_zh",
+      "prompt": "画一张未来城市日落，电影感，横版",
+      "expected_output": "Uses OpenMinis minis-model-use through scripts/openminis_image.py, saves one image under /var/minis/attachments, and returns inline image plus metadata: site, model, actual pixel clarity, aspect, quality, elapsed, file path.",
+      "files": [],
+      "assertions": [
+        { "type": "contains", "text": "openminis_image.py generate" },
+        { "type": "contains", "text": "清晰度" },
+        { "type": "contains", "text": "耗时" }
+      ]
+    },
+    {
+      "id": "image_edit_reference",
+      "prompt": "把这张图改成赛博朋克雨夜风，人物别变",
+      "expected_output": "Uses edit mode with local reference image converted to data URI and passed as top-level images array; does not upload the reference image to public hosting.",
+      "files": ["/var/minis/attachments/input.png"],
+      "assertions": [
+        { "type": "contains", "text": "openminis_image.py edit" },
+        { "type": "contains", "text": "images" },
+        { "type": "not_contains", "text": "/images/edits" }
+      ]
+    },
+    {
+      "id": "timeout_recovery",
+      "prompt": "生成一张耳机商业海报",
+      "expected_output": "If model-use times out/502/CANCEL but WisArt backend created a job, uses logged-in WisArt /api/jobs to recover the latest success output and displays normal metadata rather than blindly retrying.",
+      "files": [],
+      "assertions": [
+        { "type": "contains", "text": "/api/jobs" },
+        { "type": "contains", "text": "outputs/jobs" }
+      ]
+    }
+  ]
+}
