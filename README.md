@@ -17,6 +17,8 @@ Private standalone skills such as `blackforge-reverse-lab` and `juyue-rule-dev` 
 
 ## Install
 
+See the complete [Minis skill installation guide](./INSTALL.md).
+
 Copy a skill directory into your Minis skills folder:
 
 ```text
