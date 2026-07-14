@@ -71,16 +71,31 @@ def minis_url(path):
     return "minis://attachments/" + path.name
 
 
-def prepare_reference_image(path, max_side=512, jpeg_quality=72):
+def validate_output_path(path):
+    p = Path(path).resolve()
+    root = ATTACHMENTS.resolve()
+    if p != root and root not in p.parents:
+        die("--output must be under /var/minis/attachments")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def prepare_reference_image(path, max_side=1024, jpeg_quality=85):
     p = Path(path)
-    if Image is None:
+    if Image is None or max_side <= 0:
         return p
     try:
-        img = Image.open(p).convert("RGB")
+        img = Image.open(p)
+        # Preserve transparency and hard edges for logos/product assets.
+        has_alpha = img.mode in ("RGBA", "LA") or "transparency" in img.info
         img.thumbnail((max_side, max_side))
-        out = WORKSPACE / f"i2i_ref_{uuid4().hex[:8]}.jpg"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out, "JPEG", quality=jpeg_quality, optimize=True)
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        if has_alpha:
+            out = WORKSPACE / f"i2i_ref_{uuid4().hex[:8]}.png"
+            img.convert("RGBA").save(out, "PNG", optimize=True)
+        else:
+            out = WORKSPACE / f"i2i_ref_{uuid4().hex[:8]}.jpg"
+            img.convert("RGB").save(out, "JPEG", quality=jpeg_quality, optimize=True)
         return out
     except Exception:
         return p
@@ -218,16 +233,17 @@ def generate(args):
     model, provider = select_model(args.model, args.provider)
     payload = build_common(args, model)
     payload["prompt"] = args.prompt
-    output = Path(args.output) if args.output else out_path("image_gen")
-    if not output.is_absolute():
-        die("--output must be an absolute path under /var/minis/attachments")
+    output = validate_output_path(args.output) if args.output else out_path("image_gen")
     run_model_use(payload, output, provider, model)
 
 
 def edit(args):
     model, provider = select_model(args.model, args.provider)
+    if len(args.image) > 16:
+        die("WisArt accepts at most 16 reference images")
     for img in args.image:
-        if not Path(img).exists():
+        p = Path(img)
+        if not p.exists() or not p.is_file():
             die(f"image not found: {img}")
     prepared = [prepare_reference_image(img, args.ref_max_side, args.ref_quality) for img in args.image]
     data_uris = [image_data_uri(img) for img in prepared]
@@ -236,9 +252,7 @@ def edit(args):
         "prompt": args.prompt,
         "images": data_uris,
     })
-    output = Path(args.output) if args.output else out_path("image_edit")
-    if not output.is_absolute():
-        die("--output must be an absolute path under /var/minis/attachments")
+    output = validate_output_path(args.output) if args.output else out_path("image_edit")
     run_model_use(payload, output, provider, model)
 
 
@@ -251,7 +265,7 @@ def main():
     common.add_argument("--size", default="1200x675")
     common.add_argument("--quality", default="auto")
     common.add_argument("--resolution", default="1K", choices=["1K", "2K", "4K"], help="WisArt frontend resolution tier")
-    common.add_argument("--n", type=int, default=1)
+    common.add_argument("--n", type=int, default=1, choices=range(1, 6), metavar="1..5")
     common.add_argument("--response-format", default="url", choices=["b64_json", "url"], help="Default url reduces large base64 timeout risk")
     common.add_argument("--output")
     common.add_argument("--extra-body", help="JSON object merged into model-use request body")
@@ -261,8 +275,8 @@ def main():
     e = sub.add_parser("edit", parents=[common])
     e.add_argument("--prompt", required=True)
     e.add_argument("--image", action="append", required=True)
-    e.add_argument("--ref-max-side", type=int, default=512, help="Compress reference image longest side before data URI")
-    e.add_argument("--ref-quality", type=int, default=72, help="JPEG quality for compressed reference")
+    e.add_argument("--ref-max-side", type=int, default=1024, help="Reference longest side; 0 keeps original (larger payload)")
+    e.add_argument("--ref-quality", type=int, default=85, choices=range(40, 96), metavar="40..95", help="JPEG quality; alpha images stay PNG")
     e.set_defaults(func=edit)
     args = p.parse_args()
     args.func(args)

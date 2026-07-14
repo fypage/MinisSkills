@@ -2,7 +2,7 @@
 name: image-generator
 description: >
   Generate or edit images using OpenMinis built-in model-use with the user-configured image_output provider, especially 智画创 / WisArt gpt-image-2. Trigger whenever the user asks to “生图”, “画图”, “生成图片”, “文生图”, “改图”, “图生图”, “图片编辑”, “出一张图”, mentions WisArt, 智画创, gpt-image-2, or provides an image plus an edit instruction. The assistant calls the model directly, saves outputs to /var/minis/attachments, and displays the image with site/model/clarity/aspect/quality/elapsed/path metadata.
-version: 0.1
+version: 0.2
 compatibility: OpenMinis Android 0.18+; uses minis-model-use image_output. No environment variable or raw API key required when the provider/model is configured in the app.
 ---
 # OpenMinis Image Generator
@@ -37,7 +37,7 @@ python3 /var/minis/skills/image-generator/scripts/openminis_image.py edit \
   --size 9:16 --resolution 1K --quality auto --n 1
 ```
 
-For image-to-image, the wrapper compresses local reference images, converts them to data URI, and passes them as top-level `images: [data_uri]` through the normal generations channel. This is the format verified with WisArt through `minis-model-use`. Do not upload reference images to a VPS/public host.
+For image-to-image, the wrapper converts up to 16 local references to data URIs and passes top-level `images: [data_uri]` through `minis-model-use`. It defaults to a 1024px longest side at JPEG quality 85; transparent images remain PNG. Use `--ref-max-side 0` only when original-resolution references are necessary and the larger payload is acceptable. Do not upload references to a VPS/public host.
 
 ## Parameters
 
@@ -48,8 +48,9 @@ For image-to-image, the wrapper compresses local reference images, converts them
 | `size` | `1200x675` | WisArt also accepts aspect ratios: `1:1`, `4:5`, `3:4`, `2:3`, `3:2`, `4:3`, `16:9`, `9:16`, `21:9`. |
 | `resolution` | `1K` | WisArt frontend clarity tier: `1K`, `2K`, `4K`. |
 | `quality` | `auto` | Compatibility field. Prefer `resolution` for clarity; use `medium`/`high` only when needed. |
-| `n` | `1` | Generate one first unless the user asks for more. |
+| `n` | `1` | Valid range `1–5`; generate one first unless the user asks for more. |
 | `response_format` | `url` | Reduces large base64 timeout risk. |
+| references | — | Edit accepts `1–16` JPG/JPEG/PNG/WebP/GIF files; animated GIF behavior is provider-dependent. |
 
 ## Output Format
 
@@ -83,9 +84,9 @@ WisArt's OpenAI-compatible `/v1/images/generations` is synchronous and may time 
 1. Do not blindly retry multiple times.
 2. If logged into WisArt in the browser, open/query:
    - `https://wisart.kuaileshifu.com/api/jobs?limit=8`
-3. Find the latest `status: success` job matching the prompt/model/size.
-4. Download its first output path, e.g. `https://wisart.kuaileshifu.com/outputs/jobs/.../01.png`.
-5. Copy the downloaded file to `/var/minis/attachments/` and display it with the normal metadata card.
+3. Match by request start time plus exact `prompt`, `model`, `size`, `resolution`, and `n`; do not simply take the newest job.
+4. Accept only `status: success` with a non-empty `outputs` array. A failed 2K/4K upscale may expose `ai_upscale_sources` while `outputs` is empty; report the failure/refund state and do not present the intermediate source as the requested final image unless the user explicitly asks to salvage it.
+5. Download every path in `outputs` (not only the first), copy all files to `/var/minis/attachments/`, and display each inline with one shared metadata summary.
 
 Useful WisArt frontend APIs:
 
@@ -106,6 +107,8 @@ GET /api/jobs?limit=8   # recent jobs and output paths
 ## Failure Handling
 
 - If no image_output model is available, ask the user to add/enable a生图模型 in `[Settings → Providers](minis://settings/providers)` or `[Settings → Model Groups](minis://settings/model-groups)`.
-- If output path is relative, retry with an absolute `/var/minis/attachments/...` path.
+- Output must resolve under `/var/minis/attachments/`; reject paths outside it.
+- Validate `n=1–5` and edit reference count `1–16` before invoking the model.
 - If WisArt backend shows success but local fetch timed out, recover from `/api/jobs` as above.
-- If the provider reports maintenance/unavailable, stop retrying and report it briefly.
+- HTTP 503 means maintenance/unavailable: stop retrying and report it briefly.
+- `mask`, `background`, `moderation`, `output_format`, `output_compression`, and `user` are compatibility fields; do not promise they affect generation unless a provider test confirms it.

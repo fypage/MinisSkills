@@ -35,6 +35,14 @@ Image-to-image/edit request body verified with WisArt through model-use:
 
 Use top-level `images: [data_uri]` for model-use. Do not default to `/images/edits` for this path.
 
+## Current API boundaries
+
+- `/v1/images/generations`: `n=1–5`; `response_format=url|b64_json`; maintenance returns HTTP 503.
+- `/v1/images/edits`: multipart `image` may repeat, or JSON may use `images`; supports at most 16 JPG/JPEG/PNG/WebP/GIF references.
+- `size`: accepts `auto`, common aspect ratios, `宽x高`, or `宽*高`; backend maps arbitrary dimensions to the closest aspect and infers 1K/2K/4K by area.
+- `quality`: `auto|low|medium|high|hd`; with ratio/auto size, medium maps to 2K and high/hd to 4K.
+- `mask`, `background`, `moderation`, `output_format`, `output_compression`, and `user` are accepted for compatibility but may be ignored by the active generation channel.
+
 ## WisArt frontend APIs for recovery
 
 When synchronous OpenAI-compatible generation times out but the backend job succeeds, recover through the logged-in frontend APIs:
@@ -74,6 +82,8 @@ Common timeout/failure fields:
   "points_refunded": true
 }
 ```
+
+Recovery matching must use `created_at >= request_started_at` and exact `prompt/model/size/resolution/n`. Accept only `status="success"` with non-empty `outputs`; download every output path. Real 4K failures can have `status="failed"`, `outputs=[]`, and non-empty `ai_upscale_sources` because the base generation succeeded but all AI upscalers failed. Do not silently treat an upscale source as the requested final image. Check `points_refunded` before stating whether points were returned.
 
 ## Display metadata
 
