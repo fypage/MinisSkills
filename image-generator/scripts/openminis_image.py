@@ -20,8 +20,14 @@ from uuid import uuid4
 
 WORKSPACE = Path("/var/minis/workspace")
 ATTACHMENTS = Path("/var/minis/attachments")
-PREFERRED_PROVIDER = "智画创"
 PREFERRED_MODEL = "gpt-image-2"
+# Providers known to be retired/unavailable. They remain selectable explicitly for
+# historical recovery, but auto-selection must not route new paid jobs to them.
+DEPRECATED_PROVIDERS = {"智画创"}
+# These providers return image data reliably only when prompted through an
+# image-generation tool request. Their /images/generations response shape is
+# not fully compatible with model-use's top-level prompt/size parser.
+IMAGE_TOOL_PROVIDERS = {"picpi 皮皮工艺站"}
 
 
 def die(msg, code=1):
@@ -37,8 +43,10 @@ def parse_json_from_output(text):
     return json.loads(text[start:end + 1])
 
 
-def select_model(model=None, provider=None):
-    if model:
+def select_model(model=None, provider=None, allow_deprecated=False):
+    if provider in DEPRECATED_PROVIDERS and not allow_deprecated:
+        die(f"Provider is retired/unavailable and blocked for new jobs: {provider}")
+    if model and provider:
         return model, provider
     p = subprocess.run(
         ["minis-model-use", "list", "--modality", "image_output"],
@@ -51,14 +59,25 @@ def select_model(model=None, provider=None):
     data = parse_json_from_output(p.stdout)
     models = data.get("models") or []
     if not models:
-        die("No image_output model found. Add/enable a生图模型 in OpenMinis Settings → Providers / Model Groups, then ask me to generate the image.")
-    for m in models:
-        if m.get("model_id") == PREFERRED_MODEL and m.get("instance_label") == PREFERRED_PROVIDER:
-            return m["model_id"], m.get("instance_label")
-    for m in models:
-        if m.get("model_id") == PREFERRED_MODEL:
-            return m["model_id"], m.get("instance_label")
-    m = models[0]
+        die("No image_output model found. Add/enable one in OpenMinis Settings → Providers / Model Groups.")
+    if provider:
+        models = [m for m in models if m.get("instance_label") == provider]
+        if not models:
+            die(f"No image_output model found for provider: {provider}")
+    if not allow_deprecated:
+        active = [m for m in models if m.get("instance_label") not in DEPRECATED_PROVIDERS]
+        if active:
+            models = active
+        elif not provider:
+            die("Only deprecated/unavailable image providers are configured. Add or enable a replacement provider before generating a new image.")
+    if model:
+        exact = [m for m in models if m.get("model_id") == model or m.get("entry_id") == model]
+        if exact:
+            m = exact[0]
+            return m.get("model_id") or m.get("entry_id"), m.get("instance_label")
+        return model, provider
+    preferred = [m for m in models if m.get("model_id") == PREFERRED_MODEL]
+    m = preferred[0] if preferred else models[0]
     return m.get("model_id") or m.get("entry_id"), m.get("instance_label")
 
 
@@ -191,8 +210,14 @@ def run_model_use(payload, output, provider, model):
         die("image generation failed: " + json.dumps(parsed, ensure_ascii=False), 2)
     if not output.exists() or output.stat().st_size == 0:
         die(f"image generation did not produce output file: {output}", 2)
-    elapsed = format_elapsed(time.time() - started)
     dims = image_dimensions(output)
+    if Image is not None and not dims:
+        try:
+            output.unlink()
+        except OSError:
+            pass
+        die("provider output is not a decodable image; rejected and removed", 2)
+    elapsed = format_elapsed(time.time() - started)
     pixel_size = f"{dims[0]}x{dims[1]}" if dims else str(payload.get("size"))
     aspect = aspect_from_dims(dims, fallback=str(payload.get("size")))
     tier = infer_tier(payload.get("quality"), pixel_size, payload.get("resolution"))
@@ -220,31 +245,62 @@ def build_common(args, selected_model):
         "model": selected_model,
         "size": args.size,
         "quality": args.quality,
-        "resolution": args.resolution,
         "n": args.n,
         "response_format": args.response_format,
     }
+    # resolution is provider-specific; omit it unless explicitly requested.
+    if args.resolution:
+        payload["resolution"] = args.resolution
     if args.extra_body:
-        payload.update(json.loads(args.extra_body))
+        try:
+            extra = json.loads(args.extra_body)
+        except json.JSONDecodeError as e:
+            die(f"--extra-body must be a JSON object: {e}")
+        if not isinstance(extra, dict):
+            die("--extra-body must be a JSON object")
+        payload.update(extra)
     return payload
 
 
 def generate(args):
-    model, provider = select_model(args.model, args.provider)
-    payload = build_common(args, model)
-    payload["prompt"] = args.prompt
+    model, provider = select_model(args.model, args.provider, args.allow_deprecated_provider)
+    if provider in IMAGE_TOOL_PROVIDERS:
+        # Do not include top-level prompt/size/n: model-use interprets those as
+        # /images/generations, whose Picpi response may contain no extractable
+        # image. The tool request is verified to return a real media file.
+        request_text = args.prompt
+        if args.size and args.size != "auto":
+            request_text += f"\nRequested output aspect ratio or size: {args.size}."
+        if args.n > 1:
+            request_text += f"\nGenerate exactly {args.n} distinct images."
+        payload = {
+            "messages": [{"role": "user", "content": request_text}],
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": "required",
+        }
+    else:
+        payload = build_common(args, model)
+        payload["prompt"] = args.prompt
     output = validate_output_path(args.output) if args.output else out_path("image_gen")
     run_model_use(payload, output, provider, model)
 
 
 def edit(args):
-    model, provider = select_model(args.model, args.provider)
+    model, provider = select_model(args.model, args.provider, args.allow_deprecated_provider)
     if len(args.image) > 16:
-        die("WisArt accepts at most 16 reference images")
+        die("At most 16 reference images are supported")
     for img in args.image:
         p = Path(img)
         if not p.exists() or not p.is_file():
             die(f"image not found: {img}")
+        if p.stat().st_size > 50 * 1024 * 1024:
+            die(f"reference image exceeds 50 MiB: {img}")
+        if Image is not None:
+            try:
+                with Image.open(p) as ref:
+                    ref.verify()
+            except Exception:
+                die(f"reference is not a decodable image: {img}")
     prepared = [prepare_reference_image(img, args.ref_max_side, args.ref_quality) for img in args.image]
     data_uris = [image_data_uri(img) for img in prepared]
     payload = build_common(args, model)
@@ -264,7 +320,8 @@ def main():
     common.add_argument("--provider", default="", help="Optional provider label; omitted = auto-select")
     common.add_argument("--size", default="1200x675")
     common.add_argument("--quality", default="auto")
-    common.add_argument("--resolution", default="1K", choices=["1K", "2K", "4K"], help="WisArt frontend resolution tier")
+    common.add_argument("--resolution", default="", choices=["", "1K", "2K", "4K"], help="Optional provider-specific resolution tier; omitted by default")
+    common.add_argument("--allow-deprecated-provider", action="store_true", help="Allow explicit use of a retired provider; never enabled automatically")
     common.add_argument("--n", type=int, default=1, choices=range(1, 6), metavar="1..5")
     common.add_argument("--response-format", default="url", choices=["b64_json", "url"], help="Default url reduces large base64 timeout risk")
     common.add_argument("--output")

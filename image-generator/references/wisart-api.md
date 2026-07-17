@@ -1,6 +1,8 @@
-# WisArt / 智画创 Notes
+# WisArt / 智画创 Historical Recovery Notes
 
-This skill normally uses OpenMinis `minis-model-use`; no raw API key is required when the provider/model is configured in the app.
+> **Archived 2026-07-17:** 智画创 announced that its public image service is closing. Do not submit new jobs or auto-select this provider. Keep this file only to recover historical outputs while the authenticated frontend remains reachable.
+
+This historical path used OpenMinis `minis-model-use`; no raw API key was required when the provider/model was configured in the app.
 
 ## OpenMinis model-use verified formats
 
