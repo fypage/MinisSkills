@@ -11,10 +11,9 @@ Generate or edit images through **OpenMinis `minis-model-use`**. Credentials sta
 
 ## Provider status
 
-- **智画创 / WisArt has closed its public service.** Do not auto-select it or submit new jobs to it.
-- Its historical recovery notes remain in `references/wisart-api.md` only for retrieving already-created outputs while the old frontend remains reachable.
-- Prefer an active configured `image_output` provider. Never switch to a second paid provider after an ambiguous timeout unless the user explicitly asks; the first backend may still complete and charge.
-- `picpi 皮皮工艺站/gpt-image-2` requires `messages + image_generation tool` for reliable output extraction. Do not send it the wrapper's normal top-level `prompt/size/n` payload; the backend may generate and bill an image while model-use receives only rewritten prompt text.
+- **智画创 / WisArt is active again as of 2026-07-18 and is the temporary preferred provider.** Its availability may be short-lived; verify it remains configured before use and do not blindly retry ambiguous failures.
+- Prefer `智画创/gpt-image-2` when active, then another configured `image_output` provider. Never switch to a second paid provider after an ambiguous timeout unless the user explicitly asks; the first backend may still complete and charge.
+- `picpi 皮皮工艺站/gpt-image-2` requires `messages + image_generation tool` for reliable output extraction. For text-to-image, send the prompt in `messages`; for image-to-image, send local compressed data URIs in the top-level `images` array plus the same tool request. Do not send it the wrapper's normal top-level `prompt/size/n` payload or Responses `input_image` objects; the backend may generate and bill an image while model-use receives only rewritten prompt text.
 - If only retired providers are configured, stop and direct the user to [Providers](minis://settings/providers) or [Model Groups](minis://settings/model-groups).
 
 ## Quick Workflow

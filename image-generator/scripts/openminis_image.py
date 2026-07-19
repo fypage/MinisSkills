@@ -21,9 +21,10 @@ from uuid import uuid4
 WORKSPACE = Path("/var/minis/workspace")
 ATTACHMENTS = Path("/var/minis/attachments")
 PREFERRED_MODEL = "gpt-image-2"
-# Providers known to be retired/unavailable. They remain selectable explicitly for
-# historical recovery, but auto-selection must not route new paid jobs to them.
-DEPRECATED_PROVIDERS = {"智画创"}
+PREFERRED_PROVIDERS = ["智画创"]
+# Providers confirmed retired/unavailable. Keep this set for future outages so
+# auto-selection can block them without removing the user's configuration.
+DEPRECATED_PROVIDERS = set()
 # These providers return image data reliably only when prompted through an
 # image-generation tool request. Their /images/generations response shape is
 # not fully compatible with model-use's top-level prompt/size parser.
@@ -76,7 +77,13 @@ def select_model(model=None, provider=None, allow_deprecated=False):
             m = exact[0]
             return m.get("model_id") or m.get("entry_id"), m.get("instance_label")
         return model, provider
-    preferred = [m for m in models if m.get("model_id") == PREFERRED_MODEL]
+    preferred = [
+        m for provider_name in PREFERRED_PROVIDERS
+        for m in models
+        if m.get("instance_label") == provider_name and m.get("model_id") == PREFERRED_MODEL
+    ]
+    if not preferred:
+        preferred = [m for m in models if m.get("model_id") == PREFERRED_MODEL]
     m = preferred[0] if preferred else models[0]
     return m.get("model_id") or m.get("entry_id"), m.get("instance_label")
 
@@ -303,11 +310,26 @@ def edit(args):
                 die(f"reference is not a decodable image: {img}")
     prepared = [prepare_reference_image(img, args.ref_max_side, args.ref_quality) for img in args.image]
     data_uris = [image_data_uri(img) for img in prepared]
-    payload = build_common(args, model)
-    payload.update({
-        "prompt": args.prompt,
-        "images": data_uris,
-    })
+    if provider in IMAGE_TOOL_PROVIDERS:
+        request_text = args.prompt
+        if args.size and args.size != "auto":
+            request_text += f"\nRequested output aspect ratio or size: {args.size}."
+        if args.n > 1:
+            request_text += f"\nGenerate exactly {args.n} distinct edited images."
+        payload = {
+            "messages": [{"role": "user", "content": request_text}],
+            # OpenMinis accepts local references through this top-level field.
+            # Do not use public URLs or Responses input_image objects here.
+            "images": data_uris,
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": "required",
+        }
+    else:
+        payload = build_common(args, model)
+        payload.update({
+            "prompt": args.prompt,
+            "images": data_uris,
+        })
     output = validate_output_path(args.output) if args.output else out_path("image_edit")
     run_model_use(payload, output, provider, model)
 
