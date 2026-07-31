@@ -2,7 +2,7 @@
 name: image-generator
 description: >
   Generate or edit images through any user-configured OpenMinis image_output provider. Trigger for 生图、画图、文生图、图生图、改图、图片编辑、局部修改, or when an image plus editing instructions is provided. Select an active provider safely, keep references local, save outputs under /var/minis/attachments, validate real image dimensions, and return inline media with generation metadata.
-version: 0.3
+version: 0.4
 compatibility: OpenMinis Android 0.18+; uses minis-model-use image_output. No environment variable or raw API key required when the provider/model is configured in the app.
 ---
 # OpenMinis Image Generator
@@ -21,9 +21,10 @@ Generate or edit images through **OpenMinis `minis-model-use`**. Credentials sta
 1. Run `minis-model-use list --modality image_output` when provider health or selection is uncertain.
 2. Decide mode: text-to-image (`generate`) or image-to-image/edit (`edit`).
 3. Refine short requests without overriding user-specified identity, composition, text, count, or aspect ratio.
-4. Run `/var/minis/skills/image-generator/scripts/openminis_image.py` without a provider for safe auto-selection, or specify a known-active provider explicitly.
-5. Validate every output as a non-empty decodable image under `/var/minis/attachments`; use actual pixel dimensions in metadata.
-6. Display all returned images inline. On timeout, report ambiguity and inspect provider-specific job status only when such an API is documented and authenticated.
+4. Run `/var/minis/skills/image-generator/scripts/openminis_image.py` without a provider for safe auto-selection, or specify a known-active provider explicitly. Use `--list-models` when inspecting current routes and `--timeout` only to change the 900-second default.
+5. Preserve user-supplied prompt text exactly when it is already complete. Harmlessly fill placeholders or refine only when the user delegates that choice. The wrapper records `prompt_sha256` and `prompt_preserved=true` without exposing the full prompt in its job journal.
+6. Validate every output as a non-empty decodable image under `/var/minis/attachments`; use actual pixel dimensions in metadata. Reference MIME types are checked from file magic, not merely extensions.
+7. Display all returned images inline. Every request gets an `image_job_*.json` journal. On failure, full CLI output is retained in `.image_gen_last_error.json`; on timeout, report ambiguity and never auto-retry or fail over.
 
 ## Script Usage
 
@@ -57,7 +58,9 @@ For image-to-image, the wrapper converts up to 16 local references to data URIs 
 | `quality` | `auto` | OpenAI-compatible field; semantics vary by provider. |
 | `n` | `1` | Valid range `1–5`; generate one first unless the user asks for more. |
 | `response_format` | `url` | Reduces large base64 timeout risk. |
-| references | — | Edit accepts `1–16` JPG/JPEG/PNG/WebP/GIF files; animated GIF behavior is provider-dependent. |
+| `timeout` | `900` seconds | A timeout is ambiguous; the wrapper records it and does not retry. |
+| `list-models` | off | Lists current `image_output` routes without submitting a job. |
+| references | — | Edit accepts `1–16` JPG/JPEG/PNG/WebP/GIF files; animated GIF behavior is provider-dependent. MIME is verified from magic bytes. |
 
 ## Output Format
 

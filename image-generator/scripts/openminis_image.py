@@ -8,6 +8,8 @@ import argparse
 import base64
 import json
 import mimetypes
+import hashlib
+import os
 import subprocess
 import sys
 import time
@@ -36,12 +38,30 @@ def die(msg, code=1):
     raise SystemExit(code)
 
 
+def parse_json_objects(text):
+    """Decode every complete JSON object embedded in mixed CLI output."""
+    decoder = json.JSONDecoder()
+    objects = []
+    pos = 0
+    while pos < len(text):
+        start = text.find("{", pos)
+        if start < 0:
+            break
+        try:
+            obj, end = decoder.raw_decode(text[start:])
+            if isinstance(obj, dict):
+                objects.append(obj)
+            pos = start + end
+        except json.JSONDecodeError:
+            pos = start + 1
+    return objects
+
+
 def parse_json_from_output(text):
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
+    objects = parse_json_objects(text)
+    if not objects:
         die("minis-model-use did not return JSON:\n" + text[:1000])
-    return json.loads(text[start:end + 1])
+    return objects[-1]
 
 
 def select_model(model=None, provider=None, allow_deprecated=False):
@@ -127,9 +147,25 @@ def prepare_reference_image(path, max_side=1024, jpeg_quality=85):
         return p
 
 
+def detect_image_mime(path):
+    """Detect supported image MIME by magic bytes, not filename alone."""
+    head = Path(path).read_bytes()[:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return mimetypes.guess_type(str(path))[0]
+
+
 def image_data_uri(path):
     p = Path(path)
-    mime = mimetypes.guess_type(str(p))[0] or "image/png"
+    mime = detect_image_mime(p)
+    if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        die(f"unsupported reference image type: {p}")
     b64 = base64.b64encode(p.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
@@ -195,7 +231,7 @@ def format_elapsed(seconds):
     return f"{seconds // 60}m{seconds % 60:02d}s"
 
 
-def run_model_use(payload, output, provider, model):
+def run_model_use(payload, output, provider, model, timeout=900, prompt_text=""):
     started = time.time()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     req = WORKSPACE / f"image_model_use_{uuid4().hex[:8]}.json"
@@ -204,10 +240,28 @@ def run_model_use(payload, output, provider, model):
     if provider:
         cmd += ["--provider", provider]
     cmd += ["--input", str(req), "--output", str(output)]
-    p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest() if prompt_text else None
+    journal = WORKSPACE / f"image_job_{uuid4().hex[:8]}.json"
+    journal_data = {"status": "submitted", "request": str(req), "output": str(output), "provider": provider, "model": model, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "prompt_sha256": prompt_hash, "prompt_preserved": True}
+    journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raw = (e.stdout or "") + (e.stderr or "")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        error_dump = WORKSPACE / ".image_gen_last_error.json"
+        error_dump.write_text(json.dumps({**journal_data, "status": "ambiguous_timeout", "timeout_seconds": timeout, "raw_output": raw}, ensure_ascii=False, indent=2), encoding="utf-8")
+        journal_data.update({"status": "ambiguous_timeout", "timeout_seconds": timeout, "error_dump": str(error_dump)})
+        journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        die(f"image request timed out after {timeout}s; outcome is ambiguous, so it was not retried. Journal: {journal}", 3)
     print(p.stdout, end="")
     if p.returncode != 0:
-        die(f"minis-model-use failed with exit {p.returncode}", p.returncode)
+        error_dump = WORKSPACE / ".image_gen_last_error.json"
+        error_dump.write_text(json.dumps({**journal_data, "status": "failed", "returncode": p.returncode, "raw_output": p.stdout}, ensure_ascii=False, indent=2), encoding="utf-8")
+        journal_data.update({"status": "failed", "returncode": p.returncode, "error_dump": str(error_dump)})
+        journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        die(f"minis-model-use failed with exit {p.returncode}; full output: {error_dump}", p.returncode)
     parsed = None
     try:
         parsed = parse_json_from_output(p.stdout)
@@ -228,8 +282,13 @@ def run_model_use(payload, output, provider, model):
     pixel_size = f"{dims[0]}x{dims[1]}" if dims else str(payload.get("size"))
     aspect = aspect_from_dims(dims, fallback=str(payload.get("size")))
     tier = infer_tier(payload.get("quality"), pixel_size, payload.get("resolution"))
+    journal_data.update({"status": "succeeded", "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "pixel_size": pixel_size, "path": str(output)})
+    journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({
         "request": str(req),
+        "journal": str(journal),
+        "prompt_sha256": prompt_hash,
+        "prompt_preserved": True,
         "model": model,
         "provider": provider,
         "site": provider or "OpenMinis image provider",
@@ -289,7 +348,7 @@ def generate(args):
         payload = build_common(args, model)
         payload["prompt"] = args.prompt
     output = validate_output_path(args.output) if args.output else out_path("image_gen")
-    run_model_use(payload, output, provider, model)
+    run_model_use(payload, output, provider, model, args.timeout, args.prompt)
 
 
 def edit(args):
@@ -331,12 +390,19 @@ def edit(args):
             "images": data_uris,
         })
     output = validate_output_path(args.output) if args.output else out_path("image_edit")
-    run_model_use(payload, output, provider, model)
+    run_model_use(payload, output, provider, model, args.timeout, args.prompt)
+
+
+def list_models_cli():
+    p = subprocess.run(["minis-model-use", "list", "--modality", "image_output"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(p.stdout, end="")
+    raise SystemExit(p.returncode)
 
 
 def main():
     p = argparse.ArgumentParser(description="Generate/edit images via the user's OpenMinis image_output model")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--list-models", action="store_true", help="List configured image_output models and exit")
+    sub = p.add_subparsers(dest="cmd")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--model", default="", help="Optional model id; omitted = auto-select image_output model")
     common.add_argument("--provider", default="", help="Optional provider label; omitted = auto-select")
@@ -347,6 +413,7 @@ def main():
     common.add_argument("--n", type=int, default=1, choices=range(1, 6), metavar="1..5")
     common.add_argument("--response-format", default="url", choices=["b64_json", "url"], help="Default url reduces large base64 timeout risk")
     common.add_argument("--output")
+    common.add_argument("--timeout", type=int, default=900, help="Request timeout seconds; timeout is treated as ambiguous and never auto-retried")
     common.add_argument("--extra-body", help="JSON object merged into model-use request body")
     g = sub.add_parser("generate", parents=[common])
     g.add_argument("--prompt", required=True)
@@ -358,6 +425,10 @@ def main():
     e.add_argument("--ref-quality", type=int, default=85, choices=range(40, 96), metavar="40..95", help="JPEG quality; alpha images stay PNG")
     e.set_defaults(func=edit)
     args = p.parse_args()
+    if args.list_models:
+        list_models_cli()
+    if not getattr(args, "cmd", None):
+        p.error("a command is required unless --list-models is used")
     args.func(args)
 
 
