@@ -2,7 +2,7 @@
 name: image-generator
 description: >
   Generate or edit images through any user-configured OpenMinis image_output provider. Trigger for 生图、画图、文生图、图生图、改图、图片编辑、局部修改, or when an image plus editing instructions is provided. Select an active provider safely, keep references local, save outputs under /var/minis/attachments, validate real image dimensions, and return inline media with generation metadata.
-version: 0.4
+version: 0.5
 compatibility: OpenMinis Android 0.18+; uses minis-model-use image_output. No environment variable or raw API key required when the provider/model is configured in the app.
 ---
 # OpenMinis Image Generator
@@ -25,6 +25,7 @@ Generate or edit images through **OpenMinis `minis-model-use`**. Credentials sta
 5. Preserve user-supplied prompt text exactly when it is already complete. Harmlessly fill placeholders or refine only when the user delegates that choice. The wrapper records `prompt_sha256` and `prompt_preserved=true` without exposing the full prompt in its job journal.
 6. Validate every output as a non-empty decodable image under `/var/minis/attachments`; use actual pixel dimensions in metadata. Reference MIME types are checked from file magic, not merely extensions.
 7. Display all returned images inline. Every request gets an `image_job_*.json` journal. On failure, full CLI output is retained in `.image_gen_last_error.json`; on timeout, report ambiguity and never auto-retry or fail over.
+8. If generation succeeded and returned a `minis://attachments/...` URL but the corresponding Linux path is unreadable or absent, run `scripts/browser_recover.py --url <minis_url> --output /var/minis/attachments/<name>.png`. This opens the already-generated media in WebView and extracts it with Canvas/Base64. It is recovery-only: never submit another model request. Close the dedicated browser tab afterward and retain the original media URL if extraction still fails.
 
 ## Script Usage
 

@@ -236,6 +236,10 @@ def run_model_use(payload, output, provider, model, timeout=900, prompt_text="")
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     req = WORKSPACE / f"image_model_use_{uuid4().hex[:8]}.json"
     req.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # minis-model-use may execute through Android native-offload under a
+    # different UID. Keep non-secret request JSON world-readable so that the
+    # native process can open it; provider credentials are never stored here.
+    req.chmod(0o644)
     cmd = ["minis-model-use", "run", "--model", model]
     if provider:
         cmd += ["--provider", provider]
@@ -268,8 +272,19 @@ def run_model_use(payload, output, provider, model, timeout=900, prompt_text="")
     except Exception:
         parsed = None
     if isinstance(parsed, dict) and parsed.get("error"):
-        die("image generation failed: " + json.dumps(parsed, ensure_ascii=False), 2)
+        detail = json.dumps(parsed, ensure_ascii=False)
+        ambiguous = any(token in detail.lower() for token in ("http 502", "http 524", "timeout", "timed out", "connection reset"))
+        status = "ambiguous_provider_error" if ambiguous else "failed"
+        error_dump = WORKSPACE / ".image_gen_last_error.json"
+        error_dump.write_text(json.dumps({**journal_data, "status": status, "raw_output": p.stdout, "parsed_error": parsed}, ensure_ascii=False, indent=2), encoding="utf-8")
+        journal_data.update({"status": status, "error_dump": str(error_dump)})
+        journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if ambiguous:
+            die(f"provider returned an ambiguous error; do not retry automatically. Journal: {journal}", 3)
+        die("image generation failed: " + detail, 2)
     if not output.exists() or output.stat().st_size == 0:
+        journal_data.update({"status": "failed_no_output"})
+        journal.write_text(json.dumps(journal_data, ensure_ascii=False, indent=2), encoding="utf-8")
         die(f"image generation did not produce output file: {output}", 2)
     dims = image_dimensions(output)
     if Image is not None and not dims:
