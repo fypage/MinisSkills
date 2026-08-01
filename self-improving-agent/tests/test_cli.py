@@ -62,6 +62,35 @@ class CLITest(unittest.TestCase):
         ident=self.make(); self.cli('--base',self.base,'promote',ident)
         out=self.cli('--base',self.base,'review').stdout
         self.assertIn('异常重复 ID：0',out); self.assertIn('public=1',out)
+    def test_review_rejects_duplicate_id_in_same_file(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; block=path.read_text()[path.read_text().index(f'## [{ident}]'):]
+        path.write_text(path.read_text()+block)
+        self.assertIn('异常重复 ID：1',self.cli('--base',self.base,'review').stdout)
+        out=self.cli('--base',self.base,'resolve',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('不唯一',out.stderr)
+    def test_review_reports_invalid_utf8(self):
+        self.make(); (self.base/'ERRORS.md').write_bytes(b'# Errors\n\xff')
+        self.assertIn('损坏文件：1',self.cli('--base',self.base,'review').stdout)
+    def test_skill_flag_is_read_only_rejected(self):
+        out=self.cli('--skill','learning','x','y',check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('只读',out.stderr)
+    def test_multiple_authoritative_sources_rejected(self):
+        ident=self.make(); other=self.shared; self.cli('init')
+        block=self.text()[self.text().index(f'## [{ident}]'):]; path=other/'LEARNINGS.md'; path.write_text(path.read_text()+block)
+        out=self.cli('--base',self.base,'resolve',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('多个权威源',out.stderr)
+    def test_legacy_only_entry_requires_migration(self):
+        legacy=Path('/var/minis/skills/self-improving-agent/data/LEARNINGS.md')
+        if not legacy.exists(): self.skipTest('legacy fixture unavailable')
+        ident=re.search(r'^## \[([^]]+)\]',legacy.read_text(),re.M).group(1)
+        with tempfile.TemporaryDirectory() as empty:
+            env=self.env|{'SELF_IMPROVING_BASE':str(Path(empty)/'shared'),'SELF_IMPROVING_PUBLIC':str(Path(empty)/'shared/public')}
+            out=subprocess.run(['python3',CLI,'resolve',ident],text=True,capture_output=True,env=env)
+        self.assertNotEqual(out.returncode,0); self.assertIn('先执行 migrate',out.stderr)
+    def test_update_rejects_missing_required_field(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; path.write_text(path.read_text().replace('**状态**: pending\n','',1))
+        out=self.cli('--base',self.base,'resolve',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('缺少必要字段 状态',out.stderr)
     def test_review_rejects_same_id_in_wrong_file_type(self):
         ident=self.make(); wrong=self.base/'ERRORS.md'; wrong.write_text(wrong.read_text()+self.text()[self.text().index(f'## [{ident}]'):])
         self.assertIn('异常重复 ID：1',self.cli('--base',self.base,'review').stdout)
