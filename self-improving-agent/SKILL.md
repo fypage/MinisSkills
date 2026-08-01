@@ -1,335 +1,133 @@
 ---
 name: self-improving-agent
-description: "自我改进记录与闭环：当命令/操作失败、用户纠错、发现知识过时、外部 API 失败、或出现可复用更优方案时触发。重要任务前可回顾历史 learnings。避免在普通闲聊、无需记录的临时失误或用户已明确不需要记录时触发。"
-version: 2.1.0
+description: "自我改进记录与闭环：在非显然的命令/工具失败、用户纠正、知识过时、可复用更优方案、能力缺口或复发模式出现时触发；重要任务前可搜索和回顾历史经验。普通闲聊、无复用价值的小失误或用户明确要求不记录时不要触发。"
+version: 3.2.0
 metadata:
   language: zh-CN
   scope: minis
 ---
 
-# 自我改进技能（Minis 版）
+# 自我改进技能（Minis v3.2）
 
-本技能用于在 Minis 环境内**记录错误、纠正与可复用的最佳实践**，形成可追踪的学习闭环。
+记录值得复用的错误、纠正和实践，并把条目推进到解决、公共提升或记忆提升，避免只积累未处理日志。
 
-## Minis 目录约定
+## 触发边界
 
-- **工作目录**：`/var/minis/workspace/`
-- **技能默认学习日志目录**：`/var/minis/skills/self-improving-agent/data/`
-- **技能内公共学习日志目录（提升后）**：`/var/minis/skills/self-improving-agent/data/public/`
-- **项目级学习日志目录（可选）**：`<project>/.learnings/`
-- **学习日志文件**：
-  - `LEARNINGS.md`（纠错、知识缺口、最佳实践）
-  - `ERRORS.md`（命令失败、异常输出）
-  - `FEATURE_REQUESTS.md`（用户提出的新能力）
+应该记录：
 
-> 默认先记到技能自己的 data 目录；当你明确指定项目时，再写到项目级日志；当问题已抽象为跨项目通用规则时，再提升到技能内公共区或 Minis 记忆系统。
+1. 非显然的命令、权限、依赖、网络、API 或工具失败。
+2. 用户纠正了事实、路径、规范、逻辑或软件实际行为。
+3. 发现旧知识或既有假设已经过时。
+4. 得到能显著减少返工的稳定做法。
+5. 同类问题复发，或用户提出可复用的新能力。
 
-## 当前最终规则
+不要记录：普通闲聊、一次性细枝末节、无复用价值的输入错误、用户明确说“不用记”，以及任何密码、Token、Cookie 或 API Key。
 
-- **默认记录位置**：`/var/minis/skills/self-improving-agent/data/`
-- **技能内公共区**：`/var/minis/skills/self-improving-agent/data/public/`
-- **项目级记录**：仅在显式传入 `--project <path>` 时使用 `<project>/.learnings/`
-- **推荐公共参数**：`--public`
-- **兼容别名**：`--workspace` 仍可用，但仅作兼容，不再推荐
-- **提升行为**：`promote <条目ID>` 会将条目复制到技能内公共区，并自动把源条目标记为 `promoted`，写回 `**已提升到**` 与 `### 解决记录`
-- **重复保护**：若条目已存在于技能内公共区，重复执行 `promote` 不会重复追加
+## 数据位置
 
-## 快速参考（Quick Reference）
+- 默认可变数据：`/var/minis/shared/self-improving-agent/`
+- 公共学习区：`/var/minis/shared/self-improving-agent/public/`
+- 项目区：显式使用 `--project <path>` 后写入 `<path>/.learnings/`
+- 旧版兼容区：`/var/minis/skills/self-improving-agent/data/`，只用于兼容搜索和迁移，不再作为默认写入位置。
 
-| 情景 | 动作 |
-|-----------|--------|
-| 命令/操作失败 | 默认记录到技能目录 `data/ERRORS.md` |
-| 用户纠正你 | 默认记录到技能目录 `data/LEARNINGS.md`，类别 `correction` |
-| 用户需要缺失能力 | 默认记录到技能目录 `data/FEATURE_REQUESTS.md` |
-| 明确指定项目上下文 | 记录到 `<project>/.learnings/` |
-| 外部 API/工具失败 | 记录到当前作用域的 `ERRORS.md`，包含集成细节 |
-| 知识过时 | 记录到当前作用域的 `LEARNINGS.md`，类别 `knowledge_gap` |
-| 发现更优方案 | 先记录到当前作用域，确认通用后再提升 |
-| 同类问题跨多个项目复发 | 提升到技能内公共区 `data/public/` |
-| 与已有条目类似 | 用 `**See Also**` 链接，并考虑提升优先级 |
-| 广泛适用的经验 | 提升到技能内公共区或 Minis 记忆（见下方“提升到 Minis 记忆”） |
+执行入口：
 
-## 触发记录规则（Minis 运行时约定）
-
-> 说明：本技能默认**不会后台自动监听**。当满足触发条件时，由助手（或你）主动调用 `scripts/minis_auto_log.sh` 落盘。
-
-### 建议“必须记录”的触发条件
-满足以下任一条，就应该记录（除非你明确说“不用记”）：
-
-1. **命令/操作失败且非显然**：例如权限、路径、依赖、网络、第三方 API 异常，需要排查才能定位。
-2. **用户纠正**：你指出我哪里理解错、逻辑不符合本软件实际、路径/规范不对。
-3. **知识更新/过时修正**：发现之前假设不适配 Minis，或文档/实现需要纠偏。
-4. **可复用的更优方案**：形成稳定做法、约定、模板、或能显著减少返工的流程。
-5. **复发模式**：同类问题在同一任务中反复出现，或跨任务/跨项目出现。
-
-### 一般不记录的情况
-- 普通闲聊、一次性小改动、没有复用价值的细枝末节。
-- 你明确要求“不要记录”。
-
-### 记录位置建议
-- **默认**先写入技能区 `data/`。
-- 确认具备跨任务复用价值后，用 `promote` 提升到技能内公共区 `data/public/`。
-
-## 与 Minis 记忆（memory）的区别与提升标准
-
-### 区别（建议理解方式）
-- 本技能日志（`data/` 与 `data/public/`）是**可编辑的工作复盘库**：记录上下文、排错过程、方案演进，允许长文本与细节。
-- Minis 记忆（`memory_write` 写入 `/var/minis/memory/`）是**跨会话长期规则/偏好**：应短、稳定、可复用；写得不好会长期“污染”后续决策。
-
-### 写入选择（先记日志，再提炼成记忆）
-- **先写本技能日志**：当内容需要上下文（错误输出、排查路径、对比方案）、暂不确定是否通用、或仍在迭代。
-- **再提升到记忆**：当结论已稳定、跨任务/跨技能都适用，且能用一句话表达。
-
-### 何时提升到记忆（硬标准）
-满足以下任一条，才考虑 `memory_write`：
-1. 可以浓缩成一句“**以后遇到 X 就做 Y**”的规则，并且不依赖特定项目细节。
-2. **30 天内复发 ≥ 3 次**，或至少出现在 **2 个不同任务/领域**。
-3. 明确属于你的长期偏好/约定（例如工具使用约束、路径规范、输出格式规则），且你明确说“记住/以后都这样”。
-
-### 提升动作建议
-- 先用 `promote` 提升到技能内公共区 `data/public/`（可见性更高、便于复盘）。
-- 再从公共区条目中提炼 1~3 条短规则，用 `memory_write` 写入当日日记忆。
-
-
-用法示例：
-```bash
-# 默认写到技能自己的 data 目录
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh init
-
-# 记录技能级学习
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh learning "修复了下载超时" "使用分片与重试"
-
-# 如需明确落到项目级，再显式传 --project
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh --project /var/minis/workspace/my-project error "curl 请求失败" "HTTP 429"
-
-# 如需直接写到技能内公共区，显式传 --public
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh --public feature "支持批量导出" "运营需要日报"
-
-# 搜索技能区 + 项目区 + 技能内公共区
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh search 超时
-
-# 将条目提升到技能内公共区
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh promote LRN-20260317-ABC
-
-# 查看当前作用域
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh status
+```sh
+sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh ...
 ```
 
-## 记录格式（Logging Format）
+## 核心工作流
 
-### Learning 记录
+### 1. 先搜索再记录
 
-追加到 `.learnings/LEARNINGS.md`：
+对疑似复发问题先搜索关键词：
 
-```markdown
-## [LRN-YYYYMMDD-XXX] category
-
-**记录时间**: ISO-8601 时间戳
-**优先级**: low | medium | high | critical
-**状态**: pending
-**领域**: frontend | backend | infra | tests | docs | config
-
-### 摘要
-一行描述所学内容
-
-### 详情
-完整上下文：发生了什么、哪里错了、正确做法
-
-### 建议动作
-具体可执行的改进或修复
-
-### 元数据
-- 来源: conversation | error | user_feedback
-- 关联文件: path/to/file.ext
-- 标签: tag1, tag2
-- 相关条目: LRN-20250110-001（如有关联）
-- 模式键: simplify.dead_code | harden.input_validation（可选，复发模式追踪）
-- 复发次数: 1（可选）
-- 首次出现: 2025-01-15（可选）
-- 最近出现: 2025-01-15（可选）
-
----
+```sh
+sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh search "关键词"
 ```
 
-### Error 记录
+找到同一问题时执行 `recur <ID>`，不要创建近似重复条目；不同问题可新建并在详情中引用旧 ID。
 
-追加到 `.learnings/ERRORS.md`：
+### 2. 记录
 
-```markdown
-## [ERR-YYYYMMDD-XXX] skill_or_command_name
+```sh
+# 可复用经验或用户纠正
+sh .../minis_auto_log.sh learning "摘要" "根因和正确做法" \
+  --category correction --domain config --action "以后执行的预防动作" --tags "minis,path"
 
-**记录时间**: ISO-8601 时间戳
-**优先级**: high
-**状态**: pending
-**领域**: frontend | backend | infra | tests | docs | config
+# 非显然失败
+sh .../minis_auto_log.sh error "摘要" "实际错误" \
+  --context "操作、输入和环境" --action "修复方案" --reproducible yes
 
-### 摘要
-简要描述失败内容
-
-### Error
-```
-实际错误信息或输出
+# 缺失能力
+sh .../minis_auto_log.sh feature "能力" "用户背景" \
+  --complexity medium --frequency recurring --action "建议实现"
 ```
 
-### Context
-- 尝试的命令/操作
-- 输入或参数
-- 环境细节（如相关）
+明确项目时在入口后、命令前添加 `--project /path`；自定义目录使用 `--base /path`；直接写公共区使用 `--public`。
 
-### 建议修复
-如可识别，给出可能的解决方案
+### 3. 当前任务已解决就闭环
 
-### 元数据
-- 可复现: yes | no | unknown
-- 关联文件: path/to/file.ext
-- 相关条目: ERR-20250110-001（如复发）
+记录后若已经修复，立即执行：
 
----
+```sh
+sh .../minis_auto_log.sh resolve <ID> "具体解决办法与验证结果"
 ```
 
-### Feature Request 记录
+处理中或不处理：
 
-追加到 `.learnings/FEATURE_REQUESTS.md`：
-
-```markdown
-## [FEAT-YYYYMMDD-XXX] capability_name
-
-**记录时间**: ISO-8601 时间戳
-**优先级**: medium
-**状态**: pending
-**领域**: frontend | backend | infra | tests | docs | config
-
-### 需求能力
-用户想实现的能力
-
-### 用户背景
-为什么需要、在解决什么问题
-
-### 复杂度评估
-simple | medium | complex
-
-### 建议实现
-可能的实现方式与扩展点
-
-### 元数据
-- 频次: first_time | recurring
-- 关联功能: existing_feature_name
-
----
+```sh
+sh .../minis_auto_log.sh update <ID> --status in_progress --note "当前进展"
+sh .../minis_auto_log.sh update <ID> --status wont_fix --note "不处理原因"
 ```
 
-## ID 生成规则
+### 4. 复发与公共提升
 
-格式：`TYPE-YYYYMMDD-XXX`
-- TYPE: `LRN` (learning), `ERR` (error), `FEAT` (feature)
-- YYYYMMDD: 当前日期
-- XXX: 顺序号或随机 3 位（如 `001`, `A7B`）
-
-示例：`LRN-20250115-001`、`ERR-20250115-A3F`、`FEAT-20250115-002`
-
-## 条目解决
-
-当问题修复后，更新条目：
-
-1. 将 `**状态**: pending` → `**状态**: resolved`
-2. 在元数据后添加解决块：
-
-```markdown
-### 解决记录
-- **解决时间**: 2025-01-16T09:00:00Z
-- **提交/PR**: abc123 或 #42
-- **说明**: 简要描述做了什么
+```sh
+sh .../minis_auto_log.sh recur <ID>
+sh .../minis_auto_log.sh promote <ID>
 ```
 
-其他状态：
-- `in_progress` - 正在处理
-- `wont_fix` - 决定不修（在解决记录中写原因）
-- `promoted` - 已提升到 Minis 记忆
+`promote` 复制到共享公共区，并把源条目与副本的独立 `提升` 字段标为 `public`；不会覆盖 `pending/resolved` 生命周期状态，重复执行不会重复追加。
+
+### 5. 定期回顾
+
+在重要任务前、功能完成后或进入有历史问题的领域时：
+
+```sh
+sh .../minis_auto_log.sh review
+sh .../minis_auto_log.sh review --verbose
+```
+
+优先处理：高优先级 pending、信息不完整条目、重复出现条目，以及已解决但尚未闭环的记录。
 
 ## 提升到 Minis 记忆
 
-当某条学习具有广泛适用性（不是一次性修复），应提升到 Minis 记忆系统。
+技能日志用于保留上下文和排错过程；Minis 记忆只保存短、稳定、跨任务可复用的规则。
 
-### 何时提升
+满足任一条件才考虑写入 `memory_write`：
 
-- 学习跨多个文件/功能适用
-- 任何贡献者（人/AI）都应知道
-- 防止重复犯错
-- 记录项目约定
+- 可浓缩为一句“以后遇到 X 就做 Y”的规则；
+- 30 天内复发至少 3 次且横跨至少 2 个任务；
+- 用户明确要求长期记住某项偏好或约定。
 
-### 提升目标（Minis）
+实际调用 `memory_write` 成功后，再执行：
 
-- **日记忆**：`/var/minis/memory/YYYY-MM-DD.md`（通过 `memory_write` 写入）
-- **全局记忆**：`/var/minis/memory/GLOBAL.md`。仅当用户明确要求“全局记住/写入全局记忆”时，由助手先读取去重，再用 `file_edit` 修改；不要把临时复盘写进去。
-- **项目笔记**：建议写入 `/var/minis/workspace/PROJECT_NOTES.md`
-
-### 如何提升
-
-1. **提炼**：把学习浓缩成简洁规则或事实
-2. **写入**：使用 `memory_write` 写入日记忆，必要时同步到项目笔记
-3. **回写**：更新原条目：
-   - `**状态**: pending` → `**状态**: promoted`
-   - 添加 `**已提升**: YYYY-MM-DD.md` 或 `PROJECT_NOTES.md`
-
-## 复发模式检测
-
-如果记录内容与已有条目相似：
-
-1. **先搜索**：优先用 `minis_auto_log.sh search <keyword>`，它会覆盖技能区、公共区和显式项目区；不要假设 `/var/minis/workspace/.learnings/` 一定存在。
-2. **建立关联**：在元数据中添加 `**See Also**: ERR-20250110-001`
-3. **提升优先级**：如果问题反复出现
-4. **考虑系统性修复**：反复出现通常意味着：
-   - 文档缺失（→ 写入 PROJECT_NOTES.md 或日记忆）
-   - 自动化缺失（→ 加入脚本或工具链）
-   - 架构问题（→ 建立技术债任务）
-
-## Simplify & Harden Feed
-
-用于 ingest `simplify-and-harden` 技能中的复发模式，并将其转化为持久化的提示规则。
-
-### Ingestion Workflow
-
-1. 从任务摘要读取 `simplify_and_harden.learning_loop.candidates`。
-2. 对每个候选项使用 `pattern_key` 作为稳定去重键。
-3. 在当前作用域及公共区搜索是否已存在：
-   - `sh scripts/minis_auto_log.sh search "Pattern-Key: <pattern_key>"`
-4. 若已存在：
-   - 递增 `Recurrence-Count`
-   - 更新 `Last-Seen`
-   - 添加 `See Also` 关联
-5. 若不存在：
-   - 新建 `LRN-...` 条目
-   - 设置 `Source: simplify-and-harden`
-   - 设置 `Pattern-Key`、`Recurrence-Count: 1` 与 `First-Seen`/`Last-Seen`
-
-### 提升规则（系统提示反馈）
-
-当满足以下条件时，把复发模式提升到 Minis 记忆：
-
-- `Recurrence-Count >= 3`
-- 至少出现在 2 个不同任务
-- 在 30 天内发生
-
-提升后的规则应是**短而明确的预防规则**（做事前/做事时的动作），而不是冗长的事故复盘。
-
-## 周期性回顾
-
-在自然节点回顾 `.learnings/`：
-
-### 何时回顾
-- 开始新的重要任务前
-- 完成一个功能后
-- 进入曾有 learnings 的领域时
-- 活跃开发期间每周一次
-
-### 快速状态检查
-```bash
-# Count pending skill-level items
-grep -h "状态\*\*: pending" /var/minis/skills/self-improving-agent/data/*.md | wc -l
-
-# List pending high-priority items
-grep -B5 "优先级\*\*: high" /var/minis/skills/self-improving-agent/data/*.md | grep "^## \["
-
-# Search all configured learning scopes
-sh /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh search "领域**: backend"
+```sh
+sh .../minis_auto_log.sh update <ID> --promotion memory --note "已提炼到 YYYY-MM-DD 日记忆"
 ```
+
+只有用户明确要求写入全局记忆时，才可编辑 `GLOBAL.md`。
+
+## 维护命令
+
+```sh
+# 初始化与状态
+sh .../minis_auto_log.sh init
+sh .../minis_auto_log.sh status
+
+# 一次性迁移旧日志；按 ID 去重，旧文件不删除
+sh .../minis_auto_log.sh migrate
+```
+
+完整字段和状态定义按需读取 `references/FORMAT.md`。
