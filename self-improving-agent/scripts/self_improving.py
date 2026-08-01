@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, fcntl, hashlib, os, re, secrets, sys, tempfile
+import argparse, fcntl, hashlib, os, re, secrets, stat, sys, tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -20,9 +20,11 @@ def now(): return datetime.now().astimezone().isoformat(timespec='seconds')
 def today(): return datetime.now().astimezone().strftime('%Y%m%d')
 
 def secure_dir(path):
+    existed=path.exists()
     path.mkdir(parents=True, exist_ok=True)
-    try: os.chmod(path, 0o700)
-    except PermissionError: pass
+    if not existed:
+        try: os.chmod(path,0o700)
+        except PermissionError: pass
 
 @contextmanager
 def lock(base):
@@ -34,7 +36,9 @@ def multi_lock(*bases):
     try:
         for base in sorted({Path(x).resolve() for x in bases},key=str):
             secure_dir(base); p=base/'.lock'
-            f=open(p,'a+',encoding='utf-8'); os.chmod(p,0o600); fcntl.flock(f,fcntl.LOCK_EX); files.append(f)
+            if p.is_symlink(): sys.exit(f'拒绝符号链接锁文件：{p}')
+            flags=os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0); fd=os.open(p,flags,0o600)
+            os.fchmod(fd,0o600); f=os.fdopen(fd,'a+',encoding='utf-8'); fcntl.flock(f,fcntl.LOCK_EX); files.append(f)
         yield
     finally:
         for f in reversed(files): fcntl.flock(f,fcntl.LOCK_UN); f.close()
@@ -57,10 +61,30 @@ def init_base(base):
     with lock(base):
         for name,head in HEADERS.items():
             p=base/name
+            if p.is_symlink(): sys.exit(f'拒绝符号链接日志文件：{p}')
+            if p.exists() and not p.is_file(): sys.exit(f'日志路径不是普通文件：{p}')
             if not p.exists(): atomic_write(p,head)
             else:
-                try: os.chmod(p,0o600)
-                except PermissionError: pass
+                fd=os.open(p,os.O_RDONLY|getattr(os,'O_NOFOLLOW',0))
+                try: os.fchmod(fd,0o600)
+                finally: os.close(fd)
+
+def read_strict(path):
+    flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)
+    try: fd=os.open(path,flags)
+    except OSError as e:
+        if path.is_symlink(): sys.exit(f'拒绝符号链接日志文件：{path}')
+        sys.exit(f'无法安全打开日志文件：{path}（{e}）')
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode): sys.exit(f'日志路径不是普通文件：{path}')
+        raw=b''
+        while True:
+            chunk=os.read(fd,65536)
+            if not chunk: break
+            raw+=chunk
+    finally: os.close(fd)
+    try: return raw.decode('utf-8','strict')
+    except UnicodeError: sys.exit(f'日志不是有效 UTF-8：{path}')
 
 def entries(text): return [(m.group(1),m.group(0).rstrip()+'\n') for m in ENTRY_RE.finditer(text)]
 def block_for(text,ident):
@@ -69,21 +93,39 @@ def block_for(text,ident):
     return None
 
 def unique_block(path,ident):
-    try: text=path.read_text(encoding='utf-8',errors='strict')
-    except UnicodeError: sys.exit(f'日志不是有效 UTF-8：{path}')
+    text=read_strict(path)
     found=[b for i,b in entries(text) if i==ident]
     if len(found)!=1: sys.exit(f'条目不唯一或已损坏：{ident} → {path}')
-    block=found[0]
-    for field in ('优先级','状态'):
-        if not re.search(rf'(?m)^\*\*{field}\*\*: \S+',block): sys.exit(f'条目缺少必要字段 {field}：{ident} → {path}')
+    block=found[0]; problem=validate_entry(ident,block,path.name)
+    if problem: sys.exit(f'条目结构损坏：{ident}（{problem}）→ {path}')
     return block
 
-def replace_block(path,ident,transform):
-    text=path.read_text(encoding='utf-8',errors='strict'); matches=[b for i,b in entries(text) if i==ident]
-    if len(matches)!=1: return False
+def replacement_text(path,ident,transform):
+    text=read_strict(path); matches=[b for i,b in entries(text) if i==ident]
+    if len(matches)!=1: return None
     old=matches[0]; new=transform(old).rstrip()+'\n'
-    if new==old: return False
-    atomic_write(path,text.replace(old,new,1)); return True
+    return None if new==old else (text,text.replace(old,new,1))
+
+def replace_block(path,ident,transform):
+    change=replacement_text(path,ident,transform)
+    if change is None: return False
+    atomic_write(path,change[1]); return True
+
+def transactional_write(changes):
+    done=[]
+    try:
+        for path,old,new in changes:
+            atomic_write(path,new); done.append((path,old,new))
+    except Exception:
+        rollback_errors=[]
+        for path,old,written in reversed(done):
+            try:
+                current=read_strict(path)
+                if current==written: atomic_write(path,old)
+                else: rollback_errors.append(f'{path}: 内容已被外部修改，拒绝覆盖回滚')
+            except Exception as e: rollback_errors.append(f'{path}: {e}')
+        if rollback_errors: raise RuntimeError('事务失败且回滚不完整：'+'; '.join(rollback_errors))
+        raise
 
 def roots(args):
     result=[]
@@ -95,6 +137,9 @@ def roots(args):
         for p in workspace.rglob('.learnings'):
             if p.is_dir() and p not in result: result.append(p)
     return result
+
+def expected_file_for_id(ident):
+    return {'LRN':'LEARNINGS.md','ERR':'ERRORS.md','FEAT':'FEATURE_REQUESTS.md'}.get(ident.split('-',1)[0])
 
 def markdown_files(args):
     out=[]
@@ -109,7 +154,7 @@ def locations(args,ident):
     if not ID_RE.fullmatch(ident): return []
     out=[]
     for p in markdown_files(args):
-        if block_for(p.read_text(encoding='utf-8',errors='replace'),ident) is not None: out.append(p)
+        if block_for(read_strict(p),ident) is not None: out.append(p)
     return out
 
 def find_entry(args,ident,prefer_non_public=True):
@@ -126,18 +171,19 @@ def authoritative_locations(args,ident):
     if not primary: return []
     out=[primary]
     public=PUBLIC/primary.name
-    if public.is_file() and block_for(public.read_text(encoding='utf-8',errors='replace'),ident) is not None and public not in out: out.append(public)
+    if public.is_file() and block_for(read_strict(public),ident) is not None and public not in out: out.append(public)
     return out
 
 def new_id(prefix,paths):
-    known={ident for p in paths if p.is_file() for ident,_ in entries(p.read_text(encoding='utf-8',errors='replace'))}
+    known={ident for p in paths if p.is_file() for ident,_ in entries(read_strict(p))}
     while True:
         ident=f'{prefix}-{today()}-{secrets.token_hex(3).upper()}'
         if ident not in known: return ident
 
 def safe_text(value):
     value=str(value)
-    return re.sub(r'(?m)^(## \[)',r'\\\1',value)
+    control=r'(?:## \[|\*\*(?:优先级|状态|提升)\*\*:|### (?:提升记录|更新记录)|- (?:复发次数|最近出现):|---$)'
+    return re.sub(rf'(?m)^({control})',r'\\\1',value)
 
 def metadata(args):
     lines=[f'- 来源: {safe_text(args.source)}',f'- 作用域: {args.mode}',f'- 基础路径: {args.base}']
@@ -146,7 +192,7 @@ def metadata(args):
     return '\n'.join(lines)
 
 def append_entry(path,body):
-    text=path.read_text(encoding='utf-8',errors='replace')
+    text=read_strict(path)
     if text and not text.endswith('\n'): text+='\n'
     atomic_write(path,text+body)
 
@@ -194,12 +240,17 @@ def update(args):
         return add_note(block,'更新记录',safe_text(args.note)) if args.note else block
     changed=[]
     with multi_lock(src.parent,PUBLIC):
-        source=unique_block(src,args.id); final=apply(source)
-        if replace_block(src,args.id,lambda _: final): changed.append(src)
-        public=PUBLIC/src.name
-        if public.is_file() and block_for(public.read_text(encoding='utf-8',errors='replace'),args.id) is not None:
-            if replace_block(public,args.id,lambda _: final): changed.append(public)
-    if not changed: sys.exit(f'未找到条目：{args.id}')
+        source=unique_block(src,args.id); final=apply(source); changes=[]
+        for path in (src,PUBLIC/src.name):
+            if path!=src:
+                if not path.is_file(): continue
+                matches=[b for i,b in entries(read_strict(path)) if i==args.id]
+                if not matches: continue
+                if len(matches)!=1: sys.exit(f'公共副本条目不唯一，拒绝更新：{args.id} → {path}')
+            change=replacement_text(path,args.id,lambda _: final)
+            if change: changes.append((path,*change)); changed.append(path)
+        transactional_write(changes)
+    if not changed: sys.exit(f'未找到条目或内容未变化：{args.id}')
     print(f'已更新：{args.id} → '+', '.join(map(str,changed)))
 
 def promote(args):
@@ -215,12 +266,19 @@ def promote(args):
         if '### 提升记录' in block: return block
         return add_note(block,'提升记录',f'已提升到 {target}')
     with multi_lock(src.parent,PUBLIC):
-        source_block=unique_block(src,args.id)
-        final_block=marked(source_block)
-        if src.parent!=PUBLIC: replace_block(src,args.id,lambda _: final_block)
-        text=target.read_text(encoding='utf-8',errors='replace'); old=block_for(text,args.id)
-        if old is None: append_entry(target,final_block)
-        else: atomic_write(target,text.replace(old,final_block,1))
+        source_block=unique_block(src,args.id); final_block=marked(source_block); changes=[]
+        if src.parent!=PUBLIC:
+            change=replacement_text(src,args.id,lambda _: final_block)
+            if change: changes.append((src,*change))
+        target_text=read_strict(target); target_matches=[b for i,b in entries(target_text) if i==args.id]
+        if len(target_matches)>1: sys.exit(f'公共副本条目不唯一，拒绝提升：{args.id} → {target}')
+        old=target_matches[0] if target_matches else None
+        if old is not None:
+            problem=validate_entry(args.id,old,target.name)
+            if problem: sys.exit(f'公共副本结构损坏，拒绝提升：{args.id}（{problem}）')
+        target_new=(target_text+final_block) if old is None else target_text.replace(old,final_block,1)
+        if target_new!=target_text: changes.append((target,target_text,target_new))
+        transactional_write(changes)
     print(f'已提升：{args.id} → {target}')
 
 def recur(args):
@@ -233,17 +291,22 @@ def recur(args):
         return re.sub(r'(?m)^- 最近出现: .*',f'- 最近出现: {now()}',block)
     changed=[]
     with multi_lock(src.parent,PUBLIC):
-        source=unique_block(src,args.id); final=apply(source)
-        if replace_block(src,args.id,lambda _: final): changed.append(src)
-        public=PUBLIC/src.name
-        if public.is_file() and block_for(public.read_text(encoding='utf-8',errors='replace'),args.id) is not None:
-            if replace_block(public,args.id,lambda _: final): changed.append(public)
+        source=unique_block(src,args.id); final=apply(source); changes=[]
+        for path in (src,PUBLIC/src.name):
+            if path!=src:
+                if not path.is_file(): continue
+                matches=[b for i,b in entries(read_strict(path)) if i==args.id]
+                if not matches: continue
+                if len(matches)!=1: sys.exit(f'公共副本条目不唯一，拒绝更新：{args.id} → {path}')
+            change=replacement_text(path,args.id,lambda _: final)
+            if change: changes.append((path,*change)); changed.append(path)
+        transactional_write(changes)
     print(f'已记录复发：{args.id} → '+', '.join(map(str,changed)))
 
 def search(args):
     found=0
     for p in markdown_files(args):
-        for n,line in enumerate(p.read_text(encoding='utf-8',errors='replace').splitlines(),1):
+        for n,line in enumerate(read_strict(p).splitlines(),1):
             if args.keyword.casefold() in line.casefold(): print(f'{p}:{n}:{line}'); found+=1
     return 0 if found else 1
 
@@ -252,19 +315,22 @@ def signature(block):
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 def review(args):
-    counts={s:0 for s in VALID_STATES}; promotions={s:0 for s in VALID_PROMOTIONS}; incomplete=[]; duplicate={}; copies={}; seen=set(); invalid=[]
+    counts={s:0 for s in VALID_STATES}; promotions={s:0 for s in VALID_PROMOTIONS}; incomplete=[]; duplicate={}; copies={}; seen=set(); invalid=[]; malformed=[]
     for p in markdown_files(args):
         try: text=p.read_text(encoding='utf-8',errors='strict')
         except UnicodeError: invalid.append(str(p)); continue
         for ident,block in entries(text):
             duplicate.setdefault(ident,[]).append(str(p)); copies.setdefault(ident,[]).append((p,signature(block)))
+            state_match=re.search(r'(?m)^\*\*状态\*\*: (\S+)',block); state=state_match.group(1) if state_match else None; promotion=promotion_of(block)
+            legacy_state=state in ('promoted_public','promoted_memory')
+            problem=validate_entry(ident,block,p.name)
+            if problem: malformed.append(f'{ident}@{p}({problem})')
             if ident in seen: continue
-            seen.add(ident); m=re.search(r'(?m)^\*\*状态\*\*: (\S+)',block)
-            if m:
-                state=m.group(1)
-                if state in ('promoted_public','promoted_memory'): state='pending'
+            seen.add(ident)
+            if state:
+                if legacy_state: state='pending'
                 counts[state]=counts.get(state,0)+1
-            promotion=promotion_of(block); promotions[promotion]=promotions.get(promotion,0)+1
+            promotions[promotion]=promotions.get(promotion,0)+1
             if '（待补充）' in block or '（未提供）' in block: incomplete.append(ident)
     expected=[]
     for ident,paths in duplicate.items():
@@ -283,27 +349,50 @@ def review(args):
         if len(active)>1 and len(set(active))>1: drift.append(ident)
     print('状态统计：'+'，'.join(f'{k}={v}' for k,v in counts.items() if v))
     print('提升统计：'+'，'.join(f'{k}={v}' for k,v in promotions.items() if v))
-    print(f'信息不完整：{len(incomplete)} 条；异常重复 ID：{len(expected)} 条；副本漂移：{len(drift)} 条；损坏文件：{len(invalid)} 个')
+    malformed=sorted(set(malformed))
+    print(f'信息不完整：{len(incomplete)} 条；结构损坏：{len(malformed)} 条；异常重复 ID：{len(expected)} 条；副本漂移：{len(drift)} 条；损坏文件：{len(invalid)} 个')
     if args.verbose:
         if invalid: print('损坏文件: '+' '.join(sorted(invalid)))
+        if malformed: print('结构损坏: '+' '.join(malformed))
         if incomplete: print('信息不完整: '+' '.join(sorted(incomplete)))
         if expected: print('异常重复: '+' '.join(sorted(expected)))
         if drift: print('副本漂移: '+' '.join(sorted(drift)))
 
+def validate_entry(ident,block,filename):
+    if not ID_RE.fullmatch(ident): return 'ID 格式无效'
+    if expected_file_for_id(ident)!=filename: return 'ID 与文件类型不匹配'
+    values={}
+    for field in ('优先级','状态','提升'):
+        found=re.findall(rf'(?m)^\*\*{field}\*\*: (\S+)',block)
+        if field in ('优先级','状态') and not found: return f'缺少必要字段 {field}'
+        if len(found)>1: return f'字段重复 {field}'
+        values[field]=found[0] if found else 'none'
+    if values['优先级'] not in ('low','medium','high','critical'): return '优先级值无效'
+    if values['状态'] not in VALID_STATES and values['状态'] not in ('promoted_public','promoted_memory'): return '状态值无效'
+    if values['提升'] not in VALID_PROMOTIONS: return '提升值无效'
+    if len(re.findall(r'(?m)^- 复发次数: \d+',block))>1: return '字段重复 复发次数'
+    return None
+
 def migrate(args):
-    init_base(DEFAULT); copied=0
-    with lock(DEFAULT):
+    init_base(DEFAULT); copied=0; changes=[]
+    with multi_lock(DEFAULT,LEGACY):
         for name in HEADERS:
             src=LEGACY/name; dst=DEFAULT/name
             if not src.is_file(): continue
-            dtext=dst.read_text(encoding='utf-8',errors='replace'); known={i for i,_ in entries(dtext)}
-            for ident,block in entries(src.read_text(encoding='utf-8',errors='replace')):
-                if ident not in known: dtext+=block; known.add(ident); copied+=1
-            atomic_write(dst,dtext)
+            source_entries=entries(read_strict(src)); ids=[i for i,_ in source_entries]
+            if len(ids)!=len(set(ids)): sys.exit(f'旧日志存在重复 ID，拒绝迁移：{src}')
+            for ident,block in source_entries:
+                problem=validate_entry(ident,block,name)
+                if problem: sys.exit(f'旧日志条目损坏，拒绝迁移：{ident}（{problem}）')
+            old=read_strict(dst); new=old; known={i for i,_ in entries(old)}
+            for ident,block in source_entries:
+                if ident not in known: new+=block; known.add(ident); copied+=1
+            if new!=old: changes.append((dst,old,new))
+        transactional_write(changes)
     print(f'迁移完成：新增 {copied} 条；旧目录保留兼容')
 
 def parser():
-    p=argparse.ArgumentParser(description='Self Improving Agent v3.2.1')
+    p=argparse.ArgumentParser(description='Self Improving Agent v3.3.0')
     g=p.add_mutually_exclusive_group(); g.add_argument('--base',type=Path); g.add_argument('--project',type=Path); g.add_argument('--public',action='store_true'); g.add_argument('--skill',action='store_true'); g.add_argument('--workspace',action='store_true',help=argparse.SUPPRESS)
     p.add_argument('--source',default='conversation'); sub=p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('migrate')

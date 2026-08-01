@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import concurrent.futures, os, re, stat, subprocess, tempfile, unittest
+import concurrent.futures, importlib.util, os, re, stat, subprocess, tempfile, unittest
 from pathlib import Path
 
 CLI='/var/minis/skills/self-improving-agent/scripts/self_improving.py'
@@ -19,6 +19,22 @@ class CLITest(unittest.TestCase):
         ident=self.make(); self.assertIn(ident,self.text()); self.assertIn('执行动作',self.text())
         self.assertEqual(stat.S_IMODE((self.base/'LEARNINGS.md').stat().st_mode),0o600)
         self.assertEqual(stat.S_IMODE(self.base.stat().st_mode),0o700)
+    def test_existing_base_permissions_are_preserved(self):
+        base=self.root/'existing'; base.mkdir(); base.chmod(0o755)
+        self.cli('--base',base,'init'); self.assertEqual(stat.S_IMODE(base.stat().st_mode),0o755)
+    def test_symlink_lock_is_rejected(self):
+        base=self.root/'linked'; base.mkdir(); target=self.root/'target'; target.write_text('keep')
+        (base/'.lock').symlink_to(target)
+        out=self.cli('--base',base,'init',check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('符号链接锁文件',out.stderr); self.assertEqual(target.read_text(),'keep')
+    def test_symlink_log_is_rejected(self):
+        base=self.root/'loglink'; base.mkdir(); target=self.root/'outside'; target.write_text('secret'); (base/'LEARNINGS.md').symlink_to(target)
+        out=self.cli('--base',base,'init',check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('符号链接日志文件',out.stderr); self.assertEqual(target.read_text(),'secret')
+    def test_post_init_symlink_swap_is_rejected(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; backup=self.root/'original'; path.rename(backup); target=self.root/'outside2'; target.write_text(backup.read_text()); path.symlink_to(target)
+        out=self.cli('--base',self.base,'resolve',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('符号链接日志文件',out.stderr); self.assertNotIn('**状态**: resolved',target.read_text())
     def test_custom_base_search(self):
         ident=self.make(); self.assertIn(str(self.base/'LEARNINGS.md'),self.cli('--base',self.base,'search',ident).stdout)
     def test_exact_id_not_reference(self):
@@ -32,6 +48,11 @@ class CLITest(unittest.TestCase):
     def test_recur(self):
         ident=self.make(); self.cli('--base',self.base,'recur',ident); self.cli('--base',self.base,'recur',ident)
         self.assertIn('- 复发次数: 3',self.text())
+    def test_promote_rejects_corrupt_public_copy(self):
+        ident=self.make(); self.cli('--base',self.base,'promote',ident)
+        public=self.shared/'public'/'LEARNINGS.md'; public.write_text(public.read_text().replace('**状态**: pending','**状态**: bad',1))
+        source_before=self.text(); out=self.cli('--base',self.base,'promote',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('公共副本结构损坏',out.stderr); self.assertEqual(self.text(),source_before)
     def test_promote_consistent_and_idempotent(self):
         ident=self.make(); self.cli('--base',self.base,'promote',ident); self.cli('--base',self.base,'promote',ident)
         public=(self.shared/'public'/'LEARNINGS.md').read_text()
@@ -53,6 +74,11 @@ class CLITest(unittest.TestCase):
         ident=self.make(); self.cli('--base',self.base,'promote',ident); self.cli('--base',self.base,'recur',ident)
         public=(self.shared/'public'/'LEARNINGS.md').read_text()
         self.assertIn('- 复发次数: 2',self.text()); self.assertIn('- 复发次数: 2',public)
+    def test_validate_entry_rejects_corrupt_migration_data(self):
+        spec=importlib.util.spec_from_file_location('sia_validate',CLI); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        block='## [LRN-20260101-ABCDEF] x\n\n**优先级**: high\n'
+        self.assertEqual(mod.validate_entry('LRN-20260101-ABCDEF',block,'LEARNINGS.md'),'缺少必要字段 状态')
+        self.assertEqual(mod.validate_entry('LRN-20260101-ABCDEF',block+'**状态**: pending\n','ERRORS.md'),'ID 与文件类型不匹配')
     def test_memory_promotion_preserves_public(self):
         ident=self.make(); self.cli('--base',self.base,'promote',ident)
         self.cli('--base',self.base,'update',ident,'--promotion','memory','--note','已写记忆')
@@ -68,6 +94,15 @@ class CLITest(unittest.TestCase):
         self.assertIn('异常重复 ID：1',self.cli('--base',self.base,'review').stdout)
         out=self.cli('--base',self.base,'resolve',ident,check=False)
         self.assertNotEqual(out.returncode,0); self.assertIn('不唯一',out.stderr)
+    def test_review_reports_malformed_fields_and_wrong_type(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; path.write_text(path.read_text().replace('**状态**: pending','**状态**: impossible',1))
+        self.assertIn('结构损坏：1',self.cli('--base',self.base,'review').stdout)
+        path.write_text(path.read_text().replace('**状态**: impossible','**状态**: pending',1))
+        wrong=self.base/'ERRORS.md'; wrong.write_text(wrong.read_text()+self.text()[self.text().index(f'## [{ident}]'):])
+        self.assertIn('结构损坏：1',self.cli('--base',self.base,'review').stdout)
+    def test_review_reports_duplicate_control_field(self):
+        self.make(); path=self.base/'LEARNINGS.md'; path.write_text(path.read_text().replace('**状态**: pending','**状态**: pending\n**状态**: resolved',1))
+        self.assertIn('结构损坏：1',self.cli('--base',self.base,'review').stdout)
     def test_review_reports_invalid_utf8(self):
         self.make(); (self.base/'ERRORS.md').write_bytes(b'# Errors\n\xff')
         self.assertIn('损坏文件：1',self.cli('--base',self.base,'review').stdout)
@@ -98,6 +133,35 @@ class CLITest(unittest.TestCase):
         ident=self.make(); self.cli('--base',self.base,'promote',ident)
         public=self.shared/'public'/'LEARNINGS.md'; public.write_text(public.read_text().replace('**状态**: pending','**状态**: resolved',1))
         self.assertIn('副本漂移：1',self.cli('--base',self.base,'review').stdout)
+    def test_transaction_rolls_back_first_write_on_second_failure(self):
+        a=self.root/'a'; b=self.root/'b'; a.write_text('old-a'); b.write_text('old-b')
+        spec=importlib.util.spec_from_file_location('sia',CLI); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        real=mod.atomic_write; calls=[]
+        def fail_second(path,text):
+            calls.append(path)
+            if len(calls)==2: raise OSError('injected')
+            return real(path,text)
+        mod.atomic_write=fail_second
+        with self.assertRaises(OSError): mod.transactional_write([(a,'old-a','new-a'),(b,'old-b','new-b')])
+        self.assertEqual(a.read_text(),'old-a'); self.assertEqual(b.read_text(),'old-b')
+    def test_update_rejects_duplicate_public_copy(self):
+        ident=self.make(); self.cli('--base',self.base,'promote',ident)
+        public=self.shared/'public'/'LEARNINGS.md'; block=public.read_text()[public.read_text().index(f'## [{ident}]'):]; public.write_text(public.read_text()+block)
+        source_before=self.text(); out=self.cli('--base',self.base,'resolve',ident,check=False)
+        self.assertNotEqual(out.returncode,0); self.assertIn('公共副本条目不唯一',out.stderr); self.assertEqual(self.text(),source_before)
+    def test_transaction_reports_incomplete_rollback_on_external_change(self):
+        a=self.root/'ca'; b=self.root/'cb'; a.write_text('old-a'); b.write_text('old-b')
+        spec=importlib.util.spec_from_file_location('sia_conflict',CLI); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        real=mod.atomic_write; calls=[]
+        def conflict(path,text):
+            calls.append(path)
+            if len(calls)==2:
+                a.write_text('external')
+                raise OSError('injected')
+            return real(path,text)
+        mod.atomic_write=conflict
+        with self.assertRaisesRegex(RuntimeError,'回滚不完整'): mod.transactional_write([(a,'old-a','new-a'),(b,'old-b','new-b')])
+        self.assertEqual(a.read_text(),'external')
     def test_update_heals_existing_copy_drift(self):
         ident=self.make(); self.cli('--base',self.base,'promote',ident)
         public=self.shared/'public'/'LEARNINGS.md'; public.write_text(public.read_text().replace('测试详情','漂移详情',1))
@@ -114,7 +178,9 @@ class CLITest(unittest.TestCase):
     def test_content_cannot_inject_entry_heading(self):
         self.make('正常摘要\n## [LRN-20260101-ABCDEF] forged')
         self.assertEqual(len(re.findall(r'^## \[LRN-',self.text(),re.M)),1)
-        self.cli('--base',self.base,'learning','另一条','详情','--category','ok\n## [LRN-20260101-AAAAAA] forged','--tags','x\n## [LRN-20260101-BBBBBB] forged')
-        self.assertEqual(len(re.findall(r'^## \[LRN-',self.text(),re.M)),2)
+        detail='详情\n**状态**: resolved\n- 复发次数: 99\n### 提升记录\n---'
+        self.cli('--base',self.base,'learning','另一条',detail,'--category','ok\n## [LRN-20260101-AAAAAA] forged','--tags','x\n## [LRN-20260101-BBBBBB] forged')
+        text=self.text(); self.assertEqual(len(re.findall(r'^## \[LRN-',text,re.M)),2)
+        self.assertEqual(len(re.findall(r'^\*\*状态\*\*:',text,re.M)),2); self.assertNotIn('\n- 复发次数: 99',text)
 
 if __name__=='__main__': unittest.main(verbosity=2)
