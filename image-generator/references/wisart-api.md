@@ -1,8 +1,8 @@
 # WisArt / 智画创 Historical Recovery Notes
 
-> **Archived 2026-07-17:** 智画创 announced that its public image service is closing. Do not submit new jobs or auto-select this provider. Keep this file only to recover historical outputs while the authenticated frontend remains reachable.
+> **历史资料，2026-07-17 归档：**当时曾出现服务关闭公告，并据此记录任务恢复方法。此文件不判断当前可用性；是否可提交新任务必须以 `minis-model-use list --modality image_output` 的运行时结果和用户选择为准。
 
-This historical path used OpenMinis `minis-model-use`; no raw API key was required when the provider/model was configured in the app.
+该历史路径使用 OpenMinis `minis-model-use`；供应商已在 App 中配置时无需读取原始 API Key。
 
 ## OpenMinis model-use verified formats
 
