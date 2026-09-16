@@ -1,122 +1,166 @@
 ---
 name: image-generator
-description: >
-  Generate or edit images through any user-configured OpenMinis image_output provider. Trigger for 生图、画图、文生图、图生图、改图、图片编辑、局部修改, or when an image plus editing instructions is provided. Select an active provider safely, keep references local, save outputs under /var/minis/attachments, validate real image dimensions, and return inline media with generation metadata.
-version: 0.5
-compatibility: OpenMinis Android 0.18+; uses minis-model-use image_output. No environment variable or raw API key required when the provider/model is configured in the app.
+description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
+version: 1.2.0
+compatibility: OpenMinis Android 0.18+；使用 minis-model-use image_output；凭据留在 App 供应商设置中。
 ---
-# OpenMinis Image Generator
 
-Generate or edit images through **OpenMinis `minis-model-use`**. Credentials stay in provider settings; never ask the user to paste raw keys into chat.
+# OpenMinis 图像生成与编辑
 
-## Provider status
+## 核心原则
 
-- **智画创 / WisArt is active again as of 2026-07-18 and is the temporary preferred provider.** Its availability may be short-lived; verify it remains configured before use and do not blindly retry ambiguous failures.
-- Prefer `智画创/gpt-image-2` when active, then another configured `image_output` provider. Never switch to a second paid provider after an ambiguous timeout unless the user explicitly asks; the first backend may still complete and charge.
-- `picpi 皮皮工艺站/gpt-image-2` requires `messages + image_generation tool` for reliable output extraction. For text-to-image, send the prompt in `messages`; for image-to-image, send local compressed data URIs in the top-level `images` array plus the same tool request. Do not send it the wrapper's normal top-level `prompt/size/n` payload or Responses `input_image` objects; the backend may generate and bill an image while model-use receives only rewritten prompt text.
-- If only retired providers are configured, stop and direct the user to [Providers](minis://settings/providers) or [Model Groups](minis://settings/model-groups).
+1. 通过 `minis-model-use` 调用用户已配置的 `image_output` 模型；不索取或输出 API Key。
+2. 实际生图前动态查询模型，不把临时供应商状态当作长期事实。
+3. 用户指定模型/供应商时不擅自替换；未指定时才自动选择可用路由。
+4. 参考图在本机预处理，以 data URI 随请求发送给所选模型供应商；未经明确同意不上传公共临时图床。
+5. 默认先生成 1 张；多张可能独立计费，用户明确要求后再增加。
+6. 超时、502、524、连接重置属于结果不确定，不自动重试或切换付费供应商。
+7. 只有成功保存并解码的真实图片才能交付；模型文字响应或改写后的提示词不算图片。
 
-## Quick Workflow
+## 按需参考
 
-1. Run `minis-model-use list --modality image_output` when provider health or selection is uncertain.
-2. Decide mode: text-to-image (`generate`) or image-to-image/edit (`edit`).
-3. Refine short requests without overriding user-specified identity, composition, text, count, or aspect ratio.
-4. Run `/var/minis/skills/image-generator/scripts/openminis_image.py` without a provider for safe auto-selection, or specify a known-active provider explicitly. Use `--list-models` when inspecting current routes and `--timeout` only to change the 900-second default.
-5. Preserve user-supplied prompt text exactly when it is already complete. Harmlessly fill placeholders or refine only when the user delegates that choice. The wrapper records `prompt_sha256` and `prompt_preserved=true` without exposing the full prompt in its job journal.
-6. Validate every output as a non-empty decodable image under `/var/minis/attachments`; use actual pixel dimensions in metadata. Reference MIME types are checked from file magic, not merely extensions.
-7. Display all returned images inline. Every request gets an `image_job_*.json` journal. On failure, full CLI output is retained in `.image_gen_last_error.json`; on timeout, report ambiguity and never auto-retry or fail over.
-8. If generation succeeded and returned a `minis://attachments/...` URL but the corresponding Linux path is unreadable or absent, run `scripts/browser_recover.py --url <minis_url> --output /var/minis/attachments/<name>.png`. This opens the already-generated media in WebView and extracts it with Canvas/Base64. It is recovery-only: never submit another model request. Close the dedicated browser tab afterward and retain the original media URL if extraction still fails.
+- 供应商协议、特殊路由和费用失败边界：`references/provider-compat.md`
+- 提示词编排、编辑保留项、文字/Logo、巨物题材：`references/prompt-recipes.md`
+- 历史智画创任务恢复：`references/wisart-api.md`（仅历史资料，不代表当前状态）
+- GRSAI 未并入后端审计：`references/grsai-option-audit.md`
 
-## Script Usage
+## 标准工作流
 
-Text-to-image:
+### 1. 理解请求
 
-```bash
+确定模式：
+
+- `generate`：纯文本生成；
+- `edit`：一张或多张参考图的编辑/图生图。
+
+保留用户明确给出的身份、人数、姿态、构图、文字、画幅、风格和数量。短提示可在不改变意图的前提下补全；完整提示原样提交。缺失信息只有会显著改变结果或费用时才询问。
+
+### 2. 查询并选择模型
+
+```sh
+minis-model-use list --modality image_output
+```
+
+也可使用包装器：
+
+```sh
+python3 /var/minis/skills/image-generator/scripts/openminis_image.py --list-models
+```
+
+选择规则：
+
+1. 用户明确指定的当前已配置路由；
+2. 未指定时优先精确匹配 `gpt-image-2`，否则选当前列表首项；
+3. 特殊适配只决定请求格式，不代表服务在线或价格更优。模型列表只证明已配置，不能代替远端验证。
+
+同一模型名出现在多个供应商时必须用供应商标签消歧。无可用模型时停止，并引导至 [供应商设置](minis://settings/providers) 或 [模型组](minis://settings/model-groups)。
+
+### 3. 执行
+
+依赖 `python3`、Pillow 和 `minis-model-use`；缺少 Pillow 时先安装 `apk add py3-pillow`，不得降级为仅检查文件头。先核对所选供应商支持的尺寸/质量；配置声明 `image_output` 不等于所有编辑参数均兼容。
+
+文生图：
+
+```sh
 python3 /var/minis/skills/image-generator/scripts/openminis_image.py generate \
   --prompt "未来城市日落，电影感，宽幅构图" \
-  --size 16:9 --quality auto --n 1
+  --size 1536x1024 --quality auto --n 1
 ```
 
-Image-to-image / edit:
+图生图：
 
-```bash
+```sh
 python3 /var/minis/skills/image-generator/scripts/openminis_image.py edit \
   --image /var/minis/attachments/input.png \
-  --prompt "保留人物身份和构图，改成赛博朋克雨夜风格" \
-  --size 9:16 --quality auto --n 1
+  --prompt "仅改变环境为赛博朋克雨夜；保留人物身份、姿态和构图不变" \
+  --size 1024x1536 --quality auto --n 1
 ```
 
-For image-to-image, the wrapper converts up to 16 local references to data URIs and passes top-level `images: [data_uri]` through `minis-model-use`. It defaults to a 1024px longest side at JPEG quality 85; transparent images remain PNG. Use `--ref-max-side 0` only when original-resolution references are necessary and the larger payload is acceptable. Do not upload references to a VPS/public host.
+多参考图重复传入 `--image`，最多 16 张。默认将最长边压到 1024px、无透明图转 JPEG quality 85；透明图保留 PNG。只有确需原图分辨率时用 `--ref-max-side 0`。
 
-## Parameters
+常用参数：
 
-| Parameter | Default | Notes |
+| 参数 | 默认 | 说明 |
 |---|---:|---|
-| `provider` | active provider, auto | Retired providers are excluded from automatic selection. |
-| `model` | auto, prefer `gpt-image-2` | Uses the preferred model on an active provider, otherwise the first image_output model. |
-| `size` | `1200x675` | Provider-dependent; common values include ratios such as `1:1`, `16:9`, `9:16` and pixel dimensions. |
-| `resolution` | omitted | Optional provider-specific tier: `1K`, `2K`, `4K`; pass only when supported. |
-| `quality` | `auto` | OpenAI-compatible field; semantics vary by provider. |
-| `n` | `1` | Valid range `1–5`; generate one first unless the user asks for more. |
-| `response_format` | `url` | Reduces large base64 timeout risk. |
-| `timeout` | `900` seconds | A timeout is ambiguous; the wrapper records it and does not retry. |
-| `list-models` | off | Lists current `image_output` routes without submitting a job. |
-| references | — | Edit accepts `1–16` JPG/JPEG/PNG/WebP/GIF files; animated GIF behavior is provider-dependent. MIME is verified from magic bytes. |
+| `--provider` | 自动 | 指定供应商标签；建议与 `--model` 一起使用 |
+| `--model` | 自动 | 在当前可用路由中优先 `gpt-image-2`，否则选列表首项；不偏向固定供应商 |
+| `--size` | `1200x675` | OpenAI 用像素尺寸或 auto，不接受比例字符串；Gemini 支持限定比例，像素值转比例并警告；见适配文档 |
+| `--quality` | `auto` | 供应商语义可能不同 |
+| `--resolution` | 省略 | 仅明确支持时传 `1K/2K/4K` |
+| `--n` | `1` | OpenAI 1–5，Gemini 1–4，picpi 仅1；多图可能增加费用 |
+| `--timeout` | `900` | 超时结果不确定，不自动重试 |
+| `--output` | 自动 | 必须是 `/var/minis/attachments/` 下尚不存在的文件路径，不覆盖已有文件 |
 
-## Output Format
+`--extra-body` 仅用于已核对文档的非核心扩展字段；不得借此覆盖模型、数量、提示词、参考图或请求路由。对不支持的参数停止或明确提示，不得把忽略的参数声称为已生效。
 
-After every successful generation, display exactly this style:
+### 4. 验证
+
+包装器应完成：
+
+- 仅交付本次调用产生、位于附件目录且未覆盖既有文件的输出；
+- 文件非空，Pillow 完整解码；拒绝截断图、伪文件头和 HTML/JSON 错误文本；
+- 逐张读取实际像素尺寸与比例，区分请求张数和已验证张数；少图不补任务；
+- 媒体链接保留子目录并百分号编码；
+- 在正常返回、超时、启动异常时清理临时请求；编辑结束清理本次压缩副本，不删除原始参考图；
+- 日志只存必要状态、提示词哈希和脱敏诊断，不原样打印或保存供应商响应；每任务使用独立日志；
+- 提交后超时、网关故障或无法证明未执行的失败标记为 ambiguous，不自动重试；即使本地已有图片也不能据此断言远端任务终态或计费。
+- 敏感请求清理与生成结果保留分离：异常时保留本次结果和可恢复路径，不因报错销毁已生成图片；正式附件须完整写入后原子无覆盖发布。
+- SIGTERM 受控清理不代表远端取消；SIGKILL、系统强杀、崩溃无法保证清理，不能仅凭 submitted 日志判定供应商未完成。历史遗留文件需先核实归属与活跃性，不自动删除。
+
+对文字、Logo、人物身份、手部或精细编辑，交付前用 `read_image` 视觉核验。不能仅凭模型返回成功就声称文字准确或身份完全一致。
+
+### 5. 恢复已生成媒体
+
+若模型已成功返回 `minis://attachments/...`，但 Linux 路径暂不可读，可恢复同一份媒体：
+
+```sh
+python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
+  --url minis://attachments/example.png \
+  --output /var/minis/attachments/example-recovered.png
+```
+
+这是从原媒体画面恢复，不是重新生图；不得再次调用模型。Canvas 会重编码为 PNG，不保证原始字节、元数据、动画或色彩信息保留。只接受附件资源 URL，输出不覆盖已有文件；必须取得专用标签 ID 才能操作，绝不回退到默认标签。恢复失败时保留原始媒体 URL，并如实说明路径不可读。
+
+## 失败处理
+
+- 本地参数、文件不存在、MIME 不支持、路径越界：修正后可重试，因为尚未提交模型任务。
+- 明确的模型不存在、参数拒绝：停止；不自动换付费供应商。只有提交前错误或可靠终态证据才能确认未执行。
+- 502/503/524/读取超时/连接重置及其他提交后不明错误：报告“结果不确定”，附任务日志；不自动重试。
+- 输出不是图片或无法解码：拒绝交付，不把错误文件改扩展名冒充图片。
+- 多图只返回一张：只交付实际得到的图片，说明与请求数量差异，不擅自补发任务。
+
+## 输出格式
+
+每张图片以内联方式显示：
 
 ```md
 ![生成图片]({minis_url})
+```
 
+随后给出：
+
+```md
 ### 生图信息
 
-站点：`{site}`  
+站点：`{provider}`  
 模型：`{model}`  
-清晰度：`{pixel_size}`  
-比例：`{aspect}`  
+清晰度：`{actual_width}x{actual_height}`  
+比例：`{actual_aspect}`  
 质量：`quality={quality}`  
 耗时：`{elapsed}`  
 文件路径：`{path}`
 ```
 
-Rules:
-- `清晰度` is the actual output pixel dimensions read from the saved file, e.g. `941x1672` or `1672x941`.
-- `比例` is the actual/fallback aspect ratio, e.g. `9:16`, `16:9`, `1:1`.
-- Do not show a separate `张数` line by default.
-- Do not show a separate `1K/2K/4K` line by default; it is only an internal/request tier.
-- Do not add a copy block unless the user asks.
+`清晰度` 与 `比例` 必须来自实际文件；精确约分比例与近似常见比例分别标注（近似值写“约”），不以容差标签充当严格画幅验收。未能读取时明确写请求值，不伪装成实际值。默认不展示完整提示词、请求 JSON、任务日志或额外“张数/1K”行，除非用户要求。
 
-## Timeout and failover policy
+## 维护门禁
 
-Treat `502`, `524`, connection reset, and read timeout as **ambiguous**, not definitive failure: a backend may still finish and charge.
+修改脚本后执行：
 
-1. Record provider, model, request start time, prompt hash, size, quality, count, and request file.
-2. Do not blindly retry the same provider and do not automatically submit to another paid provider.
-3. If the provider has a documented job API, match exact request fields and timestamp; accept only a successful terminal state with non-empty outputs.
-4. If status cannot be queried, report the ambiguity and let the user choose whether to retry.
-5. Retry automatically only for a definitive pre-submission/network failure known not to create a job, and at most once.
-6. Never claim refund or success without provider evidence.
+```sh
+cd /var/minis/skills/image-generator
+python3 -m unittest discover -s scripts -p 'test_*.py' -v
+python3 -m py_compile scripts/openminis_image.py scripts/browser_recover.py
+```
 
-Historical WisArt recovery details are archived in `references/wisart-api.md`; they are not a route for new jobs.
-
-## Prompt and execution guidance
-
-- Prefer one strong prompt over repeated retries. Fill harmless placeholders only when the user delegates that choice.
-- Preserve explicit character identity, count, composition, camera angle, aspect ratio, wardrobe, and text exactly; do not silently substitute characters.
-- For edits, separate **must preserve** from **must change**. Keep references local as compressed data URIs by default.
-- Never upload user references, masks, or private photos to public temporary hosting without explicit consent.
-- For multiple requested images, use `n` only when the provider reliably returns independent outputs; otherwise submit sequentially and label each prompt, but warn about separate charges.
-- For portraits, request natural anatomy, hands, eye direction, skin texture, and recognizable identity.
-- For product/logo/text images, state exact text, spelling, layout, background, and palette; verify rendered text visually before claiming success.
-- For UI/posters, request controlled hierarchy and exclude unwanted device-frame or screenshot artifacts.
-
-## Failure Handling
-
-- If no active image_output model is available, ask the user to add/enable one in [Providers](minis://settings/providers) or [Model Groups](minis://settings/model-groups).
-- Output must resolve under `/var/minis/attachments/`; reject paths outside it.
-- Validate `n=1–5`, edit reference count `1–16`, local file existence, MIME type, decodeability, output byte size, and actual dimensions.
-- Treat HTTP `503` as unavailable and stop. Treat `502/524/timeout` as ambiguous under the policy above.
-- If the returned file is HTML/JSON/error text renamed as an image, reject it.
-- `mask`, `background`, `moderation`, `output_format`, `output_compression`, `resolution`, and `user` are provider-specific compatibility fields; do not promise effects without verification.
+测试不得实际发起付费生图；模型调用一律 mock。
