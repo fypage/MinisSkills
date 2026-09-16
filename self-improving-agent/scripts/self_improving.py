@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, fcntl, hashlib, os, re, secrets, stat, sys, tempfile
+import argparse, fcntl, hashlib, os, re, secrets, signal, stat, sys, tempfile
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -7,7 +7,9 @@ from pathlib import Path
 SKILL = Path('/var/minis/skills/self-improving-agent')
 DEFAULT = Path(os.environ.get('SELF_IMPROVING_BASE', '/var/minis/shared/self-improving-agent')).resolve()
 PUBLIC = Path(os.environ.get('SELF_IMPROVING_PUBLIC', str(DEFAULT / 'public'))).resolve()
-LEGACY = SKILL / 'data'
+LEGACY = Path(os.environ.get('SELF_IMPROVING_LEGACY', str(SKILL / 'data'))).resolve()
+WORKSPACE = Path(os.environ.get('SELF_IMPROVING_WORKSPACE', '/var/minis/workspace')).resolve()
+_HELD_LOCKS = set()
 FILES = {'learning':'LEARNINGS.md','error':'ERRORS.md','feature':'FEATURE_REQUESTS.md'}
 HEADERS = {'LEARNINGS.md':'# Learnings\n','ERRORS.md':'# Errors\n','FEATURE_REQUESTS.md':'# Feature Requests\n'}
 VALID_STATES = {'pending','in_progress','resolved','wont_fix'}
@@ -20,11 +22,13 @@ def now(): return datetime.now().astimezone().isoformat(timespec='seconds')
 def today(): return datetime.now().astimezone().strftime('%Y%m%d')
 
 def secure_dir(path):
-    existed=path.exists()
-    path.mkdir(parents=True, exist_ok=True)
-    if not existed:
-        try: os.chmod(path,0o700)
-        except PermissionError: pass
+    if path.exists():
+        if not path.is_dir(): raise ValueError(f'基础路径不是目录：{path}')
+        return
+    secure_dir(path.parent)
+    try: path.mkdir(mode=0o700)
+    except FileExistsError:
+        if not path.is_dir(): raise
 
 @contextmanager
 def lock(base):
@@ -35,15 +39,25 @@ def multi_lock(*bases):
     files=[]
     try:
         for base in sorted({Path(x).resolve() for x in bases},key=str):
+            if base in _HELD_LOCKS: continue
             secure_dir(base); p=base/'.lock'
             if p.is_symlink(): sys.exit(f'拒绝符号链接锁文件：{p}')
             flags=os.O_RDWR|os.O_CREAT|getattr(os,'O_NOFOLLOW',0); fd=os.open(p,flags,0o600)
-            os.fchmod(fd,0o600); f=os.fdopen(fd,'a+',encoding='utf-8'); fcntl.flock(f,fcntl.LOCK_EX); files.append(f)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode): raise ValueError(f'锁路径不是普通文件：{p}')
+                os.fchmod(fd,0o600)
+                fcntl.flock(fd,fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd); raise
+            f=os.fdopen(fd,'a+',encoding='utf-8'); files.append((base,f)); _HELD_LOCKS.add(base)
         yield
     finally:
-        for f in reversed(files): fcntl.flock(f,fcntl.LOCK_UN); f.close()
+        for base,f in reversed(files):
+            _HELD_LOCKS.remove(base); fcntl.flock(f,fcntl.LOCK_UN); f.close()
 
 def atomic_write(path,text):
+    if path.is_symlink(): raise ValueError(f'拒绝符号链接日志文件：{path}')
+    if path.exists() and not path.is_file(): raise ValueError(f'日志路径不是普通文件：{path}')
     secure_dir(path.parent)
     fd,tmp=tempfile.mkstemp(prefix=f'.{path.name}.',suffix='.tmp',dir=path.parent)
     try:
@@ -69,8 +83,8 @@ def init_base(base):
                 try: os.fchmod(fd,0o600)
                 finally: os.close(fd)
 
-def read_strict(path):
-    flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)
+def read_strict(path, report_invalid=False):
+    flags=os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0)
     try: fd=os.open(path,flags)
     except OSError as e:
         if path.is_symlink(): sys.exit(f'拒绝符号链接日志文件：{path}')
@@ -84,9 +98,13 @@ def read_strict(path):
             raw+=chunk
     finally: os.close(fd)
     try: return raw.decode('utf-8','strict')
-    except UnicodeError: sys.exit(f'日志不是有效 UTF-8：{path}')
+    except UnicodeError:
+        if report_invalid: raise
+        sys.exit(f'日志不是有效 UTF-8：{path}')
 
-def entries(text): return [(m.group(1),m.group(0).rstrip()+'\n') for m in ENTRY_RE.finditer(text)]
+def entries(text):
+    # Keep exact source bytes (including EOF without newline) for replacement.
+    return [(m.group(1),m.group(0)) for m in ENTRY_RE.finditer(text)]
 def block_for(text,ident):
     for found,block in entries(text):
         if found==ident: return block
@@ -115,15 +133,17 @@ def transactional_write(changes):
     done=[]
     try:
         for path,old,new in changes:
-            atomic_write(path,new); done.append((path,old,new))
-    except Exception:
+            if read_strict(path)!=old: raise RuntimeError(f'写入前内容已变化：{path}')
+            done.append((path,old,new))
+            atomic_write(path,new)
+    except BaseException:
         rollback_errors=[]
         for path,old,written in reversed(done):
             try:
                 current=read_strict(path)
                 if current==written: atomic_write(path,old)
-                else: rollback_errors.append(f'{path}: 内容已被外部修改，拒绝覆盖回滚')
-            except Exception as e: rollback_errors.append(f'{path}: {e}')
+                elif current!=old: rollback_errors.append(f'{path}: 内容已被外部修改，拒绝覆盖回滚')
+            except BaseException as e: rollback_errors.append(f'{path}: {e}')
         if rollback_errors: raise RuntimeError('事务失败且回滚不完整：'+'; '.join(rollback_errors))
         raise
 
@@ -132,7 +152,7 @@ def roots(args):
     for raw in [args.base,DEFAULT,PUBLIC,LEGACY,LEGACY/'public']:
         p=Path(raw)
         if p not in result: result.append(p)
-    workspace=Path('/var/minis/workspace')
+    workspace=WORKSPACE
     if workspace.exists():
         for p in workspace.rglob('.learnings'):
             if p.is_dir() and p not in result: result.append(p)
@@ -153,17 +173,25 @@ def markdown_files(args):
 def locations(args,ident):
     if not ID_RE.fullmatch(ident): return []
     out=[]
-    for p in markdown_files(args):
+    paths=markdown_files(args) if args.mode=='shared' else [args.base/name for name in HEADERS if (args.base/name).exists() or (args.base/name).is_symlink()]
+    for p in paths:
         if block_for(read_strict(p),ident) is not None: out.append(p)
     return out
 
 def find_entry(args,ident,prefer_non_public=True):
     found=locations(args,ident)
+    if args.mode in ('custom','project','public'):
+        local=[p for p in found if p.parent==args.base]
+        if len(local)>1: sys.exit(f'条目存在多个权威源，拒绝任选：{ident}')
+        return local[0] if local else None
     if prefer_non_public:
         writable=[p for p in found if p.parent not in (PUBLIC,LEGACY,LEGACY/'public')]
         if len(writable)>1: sys.exit(f'条目存在多个权威源，拒绝任选：{ident}')
         if writable: return writable[0]
         if any(p.parent==LEGACY for p in found): sys.exit(f'条目仅存在于旧只读区，请先执行 migrate：{ident}')
+    if len(found)>1: sys.exit(f'条目位置不唯一，拒绝任选：{ident}')
+    if found and found[0].parent in (LEGACY,LEGACY/'public'):
+        sys.exit(f'条目仅存在于旧只读区，请先执行 migrate：{ident}')
     return found[0] if found else None
 
 def authoritative_locations(args,ident):
@@ -181,13 +209,14 @@ def new_id(prefix,paths):
         if ident not in known: return ident
 
 def safe_text(value):
-    value=str(value)
+    value=str(value).replace('\r\n','\n').replace('\r','\n')
+    if '\x00' in value: raise ValueError('文本不能包含 NUL 字符')
     control=r'(?:## \[|\*\*(?:优先级|状态|提升)\*\*:|### (?:提升记录|更新记录)|- (?:复发次数|最近出现):|---$)'
     return re.sub(rf'(?m)^({control})',r'\\\1',value)
 
 def metadata(args):
-    lines=[f'- 来源: {safe_text(args.source)}',f'- 作用域: {args.mode}',f'- 基础路径: {args.base}']
-    if args.project: lines.append(f'- 项目路径: {args.project}')
+    lines=[f'- 来源: {safe_text(args.source)}',f'- 作用域: {args.mode}',f'- 基础路径: {safe_text(args.base)}']
+    if args.project: lines.append(f'- 项目路径: {safe_text(args.project)}')
     lines += [f'- 关联文件: {safe_text(getattr(args,"related_file",None) or "(无)")}',f'- 标签: {safe_text(getattr(args,"tags",None) or "(无)")}']
     return '\n'.join(lines)
 
@@ -201,9 +230,10 @@ def record(args,kind):
     with lock(args.base):
         ident=new_id({'learning':'LRN','error':'ERR','feature':'FEAT'}[kind],markdown_files(args)+[path]); ts=now(); detail=safe_text(args.details or '（未提供）'); summary=safe_text(args.summary); action=safe_text(args.action or '（待补充）')
         domain=safe_text(args.domain).replace('\n',' '); category=safe_text(args.category).replace('\n',' ')
+        fence='`'*max(3, max((len(m.group())+1 for m in re.finditer(r'`+',detail)),default=3))
         common=f"**记录时间**: {ts}\n**优先级**: {args.priority}\n**状态**: pending\n**提升**: none\n**领域**: {domain}\n"
         if kind=='learning': body=f"## [{ident}] {category}\n\n{common}\n### 摘要\n{summary}\n\n### 详情\n{detail}\n\n### 建议动作\n{action}\n\n### 元数据\n{metadata(args)}\n\n---\n"
-        elif kind=='error': body=f"## [{ident}] {category}\n\n{common}\n### 摘要\n{summary}\n\n### Error\n```text\n{detail}\n```\n\n### Context\n{safe_text(args.context or '（未提供）')}\n\n### 建议修复\n{action}\n\n### 元数据\n- 可复现: {args.reproducible}\n{metadata(args)}\n\n---\n"
+        elif kind=='error': body=f"## [{ident}] {category}\n\n{common}\n### 摘要\n{summary}\n\n### Error\n{fence}text\n{detail}\n{fence}\n\n### Context\n{safe_text(args.context or '（未提供）')}\n\n### 建议修复\n{action}\n\n### 元数据\n- 可复现: {args.reproducible}\n{metadata(args)}\n\n---\n"
         else: body=f"## [{ident}] {category}\n\n{common}\n### 需求能力\n{summary}\n\n### 用户背景\n{detail}\n\n### 复杂度评估\n{args.complexity}\n\n### 建议实现\n{action}\n\n### 元数据\n- 频次: {args.frequency}\n{metadata(args)}\n\n---\n"
         append_entry(path,body)
     print(f'已记录：{ident} → {path}')
@@ -233,7 +263,9 @@ def update(args):
     if not any((args.status,args.promotion,args.priority,args.note)): sys.exit('update 至少需要 --status、--promotion、--priority 或 --note')
     def apply(block):
         legacy=re.search(r'(?m)^\*\*状态\*\*: (promoted_public|promoted_memory)',block)
-        if legacy: block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
+        if legacy:
+            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy.group(1)]))
+            block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
         if args.status: block=re.sub(r'(?m)^\*\*状态\*\*: \S+',f'**状态**: {args.status}',block,1)
         if args.promotion: block=set_promotion(block,merge_promotion(promotion_of(block),args.promotion))
         if args.priority: block=re.sub(r'(?m)^\*\*优先级\*\*: \S+',f'**优先级**: {args.priority}',block,1)
@@ -241,16 +273,18 @@ def update(args):
     changed=[]
     with multi_lock(src.parent,PUBLIC):
         source=unique_block(src,args.id); final=apply(source); changes=[]
-        for path in (src,PUBLIC/src.name):
+        for path in dict.fromkeys((src,PUBLIC/src.name)):
             if path!=src:
                 if not path.is_file(): continue
                 matches=[b for i,b in entries(read_strict(path)) if i==args.id]
                 if not matches: continue
                 if len(matches)!=1: sys.exit(f'公共副本条目不唯一，拒绝更新：{args.id} → {path}')
+                unique_block(path,args.id)
             change=replacement_text(path,args.id,lambda _: final)
             if change: changes.append((path,*change)); changed.append(path)
         transactional_write(changes)
-    if not changed: sys.exit(f'未找到条目或内容未变化：{args.id}')
+    if not changed:
+        print(f'内容未变化：{args.id}'); return
     print(f'已更新：{args.id} → '+', '.join(map(str,changed)))
 
 def promote(args):
@@ -259,11 +293,13 @@ def promote(args):
     init_base(PUBLIC); target=PUBLIC/src.name
     def marked(block):
         legacy=re.search(r'(?m)^\*\*状态\*\*: (promoted_public|promoted_memory)',block)
-        if legacy: block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
+        if legacy:
+            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy.group(1)]))
+            block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
         current=promotion_of(block)
-        value='public,memory' if current=='memory' else 'public'
+        value=merge_promotion(current,'public')
         block=set_promotion(block,value)
-        if '### 提升记录' in block: return block
+        if re.search(r'(?m)^### 提升记录$',block): return block
         return add_note(block,'提升记录',f'已提升到 {target}')
     with multi_lock(src.parent,PUBLIC):
         source_block=unique_block(src,args.id); final_block=marked(source_block); changes=[]
@@ -276,7 +312,7 @@ def promote(args):
         if old is not None:
             problem=validate_entry(args.id,old,target.name)
             if problem: sys.exit(f'公共副本结构损坏，拒绝提升：{args.id}（{problem}）')
-        target_new=(target_text+final_block) if old is None else target_text.replace(old,final_block,1)
+        target_new=(target_text+('\n' if target_text and not target_text.endswith('\n') else '')+final_block) if old is None else target_text.replace(old,final_block,1)
         if target_new!=target_text: changes.append((target,target_text,target_new))
         transactional_write(changes)
     print(f'已提升：{args.id} → {target}')
@@ -288,16 +324,19 @@ def recur(args):
         m=re.search(r'(?m)^- 复发次数: (\d+)',block); count=int(m.group(1))+1 if m else 2
         if m: block=block[:m.start()]+f'- 复发次数: {count}'+block[m.end():]
         else: block=block.rstrip().removesuffix('---').rstrip()+f'\n- 复发次数: {count}\n- 最近出现: {now()}\n\n---\n'
+        if not re.search(r'(?m)^- 最近出现:',block):
+            block=block.rstrip().removesuffix('---').rstrip()+f'\n- 最近出现: {now()}\n\n---\n'
         return re.sub(r'(?m)^- 最近出现: .*',f'- 最近出现: {now()}',block)
     changed=[]
     with multi_lock(src.parent,PUBLIC):
         source=unique_block(src,args.id); final=apply(source); changes=[]
-        for path in (src,PUBLIC/src.name):
+        for path in dict.fromkeys((src,PUBLIC/src.name)):
             if path!=src:
                 if not path.is_file(): continue
                 matches=[b for i,b in entries(read_strict(path)) if i==args.id]
                 if not matches: continue
                 if len(matches)!=1: sys.exit(f'公共副本条目不唯一，拒绝更新：{args.id} → {path}')
+                unique_block(path,args.id)
             change=replacement_text(path,args.id,lambda _: final)
             if change: changes.append((path,*change)); changed.append(path)
         transactional_write(changes)
@@ -317,7 +356,7 @@ def signature(block):
 def review(args):
     counts={s:0 for s in VALID_STATES}; promotions={s:0 for s in VALID_PROMOTIONS}; incomplete=[]; duplicate={}; copies={}; seen=set(); invalid=[]; malformed=[]
     for p in markdown_files(args):
-        try: text=p.read_text(encoding='utf-8',errors='strict')
+        try: text=read_strict(p,report_invalid=True)
         except UnicodeError: invalid.append(str(p)); continue
         for ident,block in entries(text):
             duplicate.setdefault(ident,[]).append(str(p)); copies.setdefault(ident,[]).append((p,signature(block)))
@@ -363,36 +402,48 @@ def validate_entry(ident,block,filename):
     if expected_file_for_id(ident)!=filename: return 'ID 与文件类型不匹配'
     values={}
     for field in ('优先级','状态','提升'):
-        found=re.findall(rf'(?m)^\*\*{field}\*\*: (\S+)',block)
+        found=re.findall(rf'(?m)^\*\*{field}\*\*:[ \t]*(.*)$',block)
         if field in ('优先级','状态') and not found: return f'缺少必要字段 {field}'
         if len(found)>1: return f'字段重复 {field}'
         values[field]=found[0] if found else 'none'
     if values['优先级'] not in ('low','medium','high','critical'): return '优先级值无效'
     if values['状态'] not in VALID_STATES and values['状态'] not in ('promoted_public','promoted_memory'): return '状态值无效'
     if values['提升'] not in VALID_PROMOTIONS: return '提升值无效'
-    if len(re.findall(r'(?m)^- 复发次数: \d+',block))>1: return '字段重复 复发次数'
+    for field in ('复发次数','最近出现'):
+        found=re.findall(rf'(?m)^- {field}:[ \t]*(.*)$',block)
+        if len(found)>1: return f'字段重复 {field}'
+        if found and (not found[0] or (field=='复发次数' and not re.fullmatch(r'[1-9][0-9]{0,8}',found[0]))): return f'{field}值无效'
     return None
 
 def migrate(args):
-    init_base(DEFAULT); copied=0; changes=[]
-    with multi_lock(DEFAULT,LEGACY):
+    init_base(args.base); copied=0; changes=[]
+    with lock(args.base):
         for name in HEADERS:
-            src=LEGACY/name; dst=DEFAULT/name
+            src=LEGACY/name; dst=args.base/name
             if not src.is_file(): continue
             source_entries=entries(read_strict(src)); ids=[i for i,_ in source_entries]
             if len(ids)!=len(set(ids)): sys.exit(f'旧日志存在重复 ID，拒绝迁移：{src}')
             for ident,block in source_entries:
                 problem=validate_entry(ident,block,name)
                 if problem: sys.exit(f'旧日志条目损坏，拒绝迁移：{ident}（{problem}）')
-            old=read_strict(dst); new=old; known={i for i,_ in entries(old)}
+            old=read_strict(dst); new=old; target_entries=entries(old)
+            known={}
+            for ident,block in target_entries:
+                if ident in known or validate_entry(ident,block,name): sys.exit(f'目标日志损坏或重复 ID：{ident}')
+                known[ident]=block
             for ident,block in source_entries:
-                if ident not in known: new+=block; known.add(ident); copied+=1
+                if ident in known:
+                    if signature(known[ident].rstrip())!=signature(block.rstrip()):
+                        sys.exit(f'迁移同 ID 内容冲突，未覆盖：{ident}')
+                else:
+                    new+=('\n' if new and not new.endswith('\n') else '')+block
+                    known[ident]=block; copied+=1
             if new!=old: changes.append((dst,old,new))
         transactional_write(changes)
     print(f'迁移完成：新增 {copied} 条；旧目录保留兼容')
 
 def parser():
-    p=argparse.ArgumentParser(description='Self Improving Agent v3.3.0')
+    p=argparse.ArgumentParser(description='Self Improving Agent v3.4.0')
     g=p.add_mutually_exclusive_group(); g.add_argument('--base',type=Path); g.add_argument('--project',type=Path); g.add_argument('--public',action='store_true'); g.add_argument('--skill',action='store_true'); g.add_argument('--workspace',action='store_true',help=argparse.SUPPRESS)
     p.add_argument('--source',default='conversation'); sub=p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('migrate')
@@ -406,13 +457,29 @@ def parser():
     q=sub.add_parser('recur'); q.add_argument('id'); q=sub.add_parser('review'); q.add_argument('--verbose',action='store_true')
     return p
 
+def _terminate(signum, frame):
+    raise KeyboardInterrupt(f'收到信号 {signum}')
+
 def main():
+    signal.signal(signal.SIGTERM, _terminate)
     a=parser().parse_args()
     if a.project: a.project=a.project.resolve(); a.base=a.project/'.learnings'; a.mode='project'
     elif a.public or a.workspace: a.base=PUBLIC; a.mode='public'
     elif a.skill: sys.exit('--skill 已弃用：旧 data 区只读；默认使用 shared，迁移请执行 migrate')
     elif a.base: a.base=a.base.resolve(); a.mode='custom'
     else: a.base=DEFAULT; a.mode='shared'
+    if a.cmd not in ('search','review') and (a.base==LEGACY or LEGACY in a.base.parents or PUBLIC==LEGACY or LEGACY in PUBLIC.parents):
+        sys.exit('旧 data 区只读，不能作为写入目标')
+    if getattr(a,'id',None) and not ID_RE.fullmatch(a.id): sys.exit('ID 格式无效')
+    if a.cmd in FILES and not a.summary.strip(): sys.exit('摘要不能为空')
+    if a.cmd=='search' and not a.keyword.strip(): sys.exit('搜索关键词不能为空')
+    # All CLI writers share PUBLIC as coordinator; acquire before discovery.
+    if a.cmd in ('init','status','migrate','promote','update','resolve','recur',*FILES):
+        bases=[p for p in roots(a) if p!=LEGACY and LEGACY not in p.parents and p.exists()]
+        with multi_lock(*bases,a.base,PUBLIC): dispatch(a)
+    else: dispatch(a)
+
+def dispatch(a):
     if a.cmd=='init': init_base(a.base); print(f'已初始化：{a.base}')
     elif a.cmd=='status': init_base(a.base); print(f'模式: {a.mode}\n基础路径: {a.base}\n公共区: {PUBLIC}\n旧数据区: {LEGACY}')
     elif a.cmd in FILES: record(a,a.cmd)
@@ -424,4 +491,6 @@ def main():
     elif a.cmd=='review': review(a)
     elif a.cmd=='migrate': migrate(a)
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    try: main()
+    except (OSError,ValueError,RuntimeError) as e: sys.exit(f'操作失败：{e}')

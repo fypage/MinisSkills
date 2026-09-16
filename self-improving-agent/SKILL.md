@@ -1,13 +1,13 @@
 ---
 name: self-improving-agent
 description: "自我改进记录与闭环：在非显然的命令/工具失败、用户纠正、知识过时、可复用更优方案、能力缺口或复发模式出现时触发；重要任务前可搜索和回顾历史经验。普通闲聊、无复用价值的小失误或用户明确要求不记录时不要触发。"
-version: 3.3.0
+version: 3.4.0
 metadata:
   language: zh-CN
   scope: minis
 ---
 
-# 自我改进技能（Minis v3.3）
+# 自我改进技能（Minis v3.4）
 
 记录值得复用的错误、纠正和实践，并把条目推进到解决、公共提升或记忆提升，避免只积累未处理日志。
 
@@ -65,6 +65,8 @@ sh .../minis_auto_log.sh feature "能力" "用户背景" \
 ```
 
 明确项目时在入口后、命令前添加 `--project /path`；自定义目录使用 `--base /path`；直接写公共区使用 `--public`。
+
+显式作用域下，按 ID 修改只在选定目录定位源条目，不回退改其他项目；已有同 ID 公共副本仍同步。未指定作用域时可跨目录发现，多个权威源则停止。`search/review` 始终跨目录汇总读取，显式 base 不表示搜索隔离。搜索无匹配返回 1，不等于执行故障。
 
 ### 3. 当前任务已解决就闭环
 
@@ -130,4 +132,14 @@ sh .../minis_auto_log.sh status
 sh .../minis_auto_log.sh migrate
 ```
 
-完整字段和状态定义按需读取 `references/FORMAT.md`。
+`migrate` 写入所选 base（默认 shared），相同 ID 且规范化内容一致则跳过；不同内容或损坏结构报冲突，不覆盖。旧 `data/public` 不自动迁移。`status` 保留初始化行为，不是纯只读检查；只读回顾用 `review`。
+
+## 数据安全与维护门禁
+
+- CLI 写操作协调加锁，日志按文件原子替换，多文件失败尝试补偿回滚；这不是抗断电事务。SIGKILL、崩溃或回滚期间再次中断仍可能部分提交，应保留备份后核查源与公共副本。
+- 不手工复用不同项目的 ID：公共副本目前按 ID 同步，不具备独立来源身份。外部编辑器不遵守 CLI 锁，search/review 也不保证并发快照。
+- 不把该 CLI 当线程安全嵌入库；不自动迁移或清理真实历史日志。
+- 修改后运行 `python3 -m unittest discover -s /var/minis/skills/self-improving-agent/tests -v`，以及 `python3 -m py_compile /var/minis/skills/self-improving-agent/scripts/self_improving.py`、`sh -n /var/minis/skills/self-improving-agent/scripts/minis_auto_log.sh`。
+- 测试必须隔离 BASE/PUBLIC/LEGACY/WORKSPACE 到临时目录，不读写真实记录。
+
+完整字段、环境变量和状态定义按需读取 `references/FORMAT.md`。

@@ -7,7 +7,7 @@ CLI='/var/minis/skills/self-improving-agent/scripts/self_improving.py'
 class CLITest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name); self.base=self.root/'custom'; self.shared=self.root/'shared'
-        self.env=os.environ.copy(); self.env['SELF_IMPROVING_BASE']=str(self.shared); self.env['SELF_IMPROVING_PUBLIC']=str(self.shared/'public')
+        self.env=os.environ.copy(); self.env['SELF_IMPROVING_BASE']=str(self.shared); self.env['SELF_IMPROVING_PUBLIC']=str(self.shared/'public'); self.env['SELF_IMPROVING_LEGACY']=str(self.root/'legacy'); self.env['SELF_IMPROVING_WORKSPACE']=str(self.root/'workspace')
     def tearDown(self): self.tmp.cleanup()
     def cli(self,*args,check=True):
         return subprocess.run(['python3',CLI,*map(str,args)],text=True,capture_output=True,check=check,env=self.env)
@@ -112,12 +112,12 @@ class CLITest(unittest.TestCase):
     def test_multiple_authoritative_sources_rejected(self):
         ident=self.make(); other=self.shared; self.cli('init')
         block=self.text()[self.text().index(f'## [{ident}]'):]; path=other/'LEARNINGS.md'; path.write_text(path.read_text()+block)
-        out=self.cli('--base',self.base,'resolve',ident,check=False)
-        self.assertNotEqual(out.returncode,0); self.assertIn('多个权威源',out.stderr)
+        self.cli('--base',self.base,'resolve',ident)
+        self.assertIn('**状态**: resolved',self.text())
+        self.assertIn('**状态**: pending',path.read_text())
     def test_legacy_only_entry_requires_migration(self):
-        legacy=Path('/var/minis/skills/self-improving-agent/data/LEARNINGS.md')
-        if not legacy.exists(): self.skipTest('legacy fixture unavailable')
-        ident=re.search(r'^## \[([^]]+)\]',legacy.read_text(),re.M).group(1)
+        ident=self.make()
+        legacy=self.root/'legacy'/'LEARNINGS.md'; legacy.parent.mkdir(); legacy.write_text(self.text())
         with tempfile.TemporaryDirectory() as empty:
             env=self.env|{'SELF_IMPROVING_BASE':str(Path(empty)/'shared'),'SELF_IMPROVING_PUBLIC':str(Path(empty)/'shared/public')}
             out=subprocess.run(['python3',CLI,'resolve',ident],text=True,capture_output=True,env=env)
@@ -182,5 +182,138 @@ class CLITest(unittest.TestCase):
         self.cli('--base',self.base,'learning','另一条',detail,'--category','ok\n## [LRN-20260101-AAAAAA] forged','--tags','x\n## [LRN-20260101-BBBBBB] forged')
         text=self.text(); self.assertEqual(len(re.findall(r'^## \[LRN-',text,re.M)),2)
         self.assertEqual(len(re.findall(r'^\*\*状态\*\*:',text,re.M)),2); self.assertNotIn('\n- 复发次数: 99',text)
+
+
+    def module(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ,self.env):
+            spec=importlib.util.spec_from_file_location('sia_isolated',CLI)
+            mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+        return mod
+    def legacy_fixture(self):
+        ident=self.make(); legacy=self.root/'legacy'; legacy.mkdir()
+        (legacy/'LEARNINGS.md').write_text(self.text())
+        return ident,legacy
+    def test_promote_keeps_combined_memory(self):
+        ident=self.make(); self.cli('--base',self.base,'update',ident,'--promotion','public,memory')
+        self.cli('--base',self.base,'promote',ident); before=self.text()
+        self.cli('--base',self.base,'promote',ident)
+        self.assertIn('**提升**: public,memory',self.text()); self.assertEqual(before,self.text())
+    def test_legacy_memory_survives_promote_and_update(self):
+        for command in [('promote',),('update','--priority','critical')]:
+            ident=self.make(); path=self.base/'LEARNINGS.md'
+            text=path.read_text(); mod=self.module()
+            block=mod.block_for(text,ident)
+            old=block.replace('**状态**: pending','**状态**: promoted_memory').replace('**提升**: none\n','')
+            path.write_text(text.replace(block,old))
+            self.cli('--base',self.base,command[0],ident,*command[1:])
+            final=mod.block_for(self.text(),ident)
+            self.assertIn('memory',mod.promotion_of(final)); self.assertIn('**状态**: pending',final)
+    def test_public_recur_writes_once(self):
+        ident=self.make(); self.cli('--base',self.base,'promote',ident)
+        self.cli('--public','recur',ident)
+        public=self.shared/'public'/'LEARNINGS.md'
+        self.assertIn('- 复发次数: 2',public.read_text())
+        self.cli('--public','update',ident,'--priority','critical')
+        self.assertIn('**优先级**: critical',public.read_text())
+    def test_explicit_missing_id_never_changes_other_base(self):
+        ident=self.make(); before=self.text()
+        result=self.cli('--base',self.root/'other','resolve',ident,check=False)
+        self.assertNotEqual(result.returncode,0); self.assertEqual(before,self.text())
+    def test_migrate_custom_and_idempotent_no_legacy_lock(self):
+        ident,legacy=self.legacy_fixture(); dest=self.root/'migration'
+        self.cli('--base',dest,'migrate'); before=(dest/'LEARNINGS.md').read_bytes()
+        result=self.cli('--base',dest,'migrate')
+        self.assertIn('新增 0 条',result.stdout); self.assertEqual(before,(dest/'LEARNINGS.md').read_bytes())
+        self.assertFalse((legacy/'.lock').exists()); self.assertFalse((self.shared/'LEARNINGS.md').exists())
+    def test_migrate_conflict_preserves_all_data(self):
+        ident,legacy=self.legacy_fixture(); path=legacy/'LEARNINGS.md'
+        path.write_text(path.read_text().replace('测试详情','冲突详情'))
+        before=self.text(); old=path.read_bytes()
+        result=self.cli('--base',self.base,'migrate',check=False)
+        self.assertNotEqual(result.returncode,0); self.assertIn('内容冲突',result.stderr)
+        self.assertEqual(before,self.text()); self.assertEqual(old,path.read_bytes())
+    def test_legacy_base_cannot_be_written(self):
+        result=self.cli('--base',self.root/'legacy','learning','x',check=False)
+        self.assertNotEqual(result.returncode,0); self.assertFalse((self.root/'legacy').exists())
+    def test_no_newline_eof_update(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; path.write_text(self.text().rstrip())
+        self.cli('--base',self.base,'resolve',ident)
+        self.assertIn('**状态**: resolved',self.text()); self.assertEqual(self.text().count('## ['),1)
+    def test_search_exit_codes_and_empty(self):
+        ident=self.make(); self.assertEqual(self.cli('--base',self.base,'search',ident).returncode,0)
+        self.assertEqual(self.cli('--base',self.base,'search','not-present-xyz',check=False).returncode,1)
+        self.assertNotEqual(self.cli('search','  ',check=False).returncode,0)
+    def test_noop_update_succeeds(self):
+        ident=self.make(); before=self.text()
+        self.cli('--base',self.base,'update',ident,'--status','pending'); self.assertEqual(before,self.text())
+    def test_error_fence_and_path_injection(self):
+        path=self.root/'odd\n**状态**: resolved\n## [LRN-20260101-AAAAAA]'
+        self.cli('--base',path,'error','x','```\n## [ERR-20260101-AAAAAA] forged')
+        text=(path/'ERRORS.md').read_text()
+        self.assertIn('````text\n',text); self.assertEqual(len(re.findall(r'^## \[',text,re.M)),1)
+        self.assertEqual(len(re.findall(r'^\*\*状态\*\*:',text,re.M)),1)
+    def test_invalid_field_tails_and_recurrence_rejected(self):
+        mod=self.module(); ident=self.make(); block=mod.block_for(self.text(),ident)
+        for broken in [block.replace('**状态**: pending','**状态**: pending trailing'),block+'- 复发次数: invalid\n',block+'- 最近出现: x\n- 最近出现: y\n']:
+            self.assertIsNotNone(mod.validate_entry(ident,broken,'LEARNINGS.md'))
+    def test_recur_repairs_missing_last_seen(self):
+        ident=self.make(); path=self.base/'LEARNINGS.md'; path.write_text(self.text()+'- 复发次数: 2\n')
+        self.cli('--base',self.base,'recur',ident)
+        self.assertIn('- 复发次数: 3',self.text()); self.assertIn('- 最近出现:',self.text())
+    def test_corrupt_public_update_and_recur_rejected(self):
+        ident=self.make(); self.cli('--base',self.base,'promote',ident)
+        path=self.shared/'public'/'LEARNINGS.md'; path.write_text(path.read_text().replace('**状态**: pending','**状态**: invalid'))
+        before=self.text()
+        for cmd in [('resolve',ident),('recur',ident)]:
+            self.assertNotEqual(self.cli('--base',self.base,*cmd,check=False).returncode,0)
+            self.assertEqual(before,self.text())
+    def test_transaction_rolls_back_post_replace_failure(self):
+        mod=self.module(); a=self.root/'a'; b=self.root/'b'; a.write_text('a'); b.write_text('b')
+        real=mod.atomic_write; calls=[]
+        def fail(path,text):
+            calls.append(path); real(path,text)
+            if len(calls)==2: raise OSError('directory fsync failed after replace')
+        mod.atomic_write=fail
+        with self.assertRaises(OSError): mod.transactional_write([(a,'a','A'),(b,'b','B')])
+        self.assertEqual(a.read_text(),'a'); self.assertEqual(b.read_text(),'b')
+        self.assertFalse(list(self.root.glob('.*.tmp')))
+    def test_sigterm_transaction_rolls_back(self):
+        import signal
+        mod=self.module(); a=self.root/'term-a'; b=self.root/'term-b'; a.write_text('a'); b.write_text('b')
+        real=mod.atomic_write; calls=[]
+        def fail(path,text):
+            calls.append(path); real(path,text)
+            if len(calls)==2: os.kill(os.getpid(),signal.SIGTERM)
+        previous=signal.signal(signal.SIGTERM,mod._terminate)
+        mod.atomic_write=fail
+        try:
+            with self.assertRaises(KeyboardInterrupt): mod.transactional_write([(a,'a','A'),(b,'b','B')])
+        finally: signal.signal(signal.SIGTERM,previous)
+        self.assertEqual(a.read_text(),'a'); self.assertEqual(b.read_text(),'b')
+
+    def test_transaction_interrupt_rolls_back(self):
+        mod=self.module(); a=self.root/'a'; b=self.root/'b'; a.write_text('a'); b.write_text('b')
+        real=mod.atomic_write; calls=[]
+        def fail(path,text):
+            calls.append(path)
+            if len(calls)==2: raise KeyboardInterrupt()
+            real(path,text)
+        mod.atomic_write=fail
+        with self.assertRaises(KeyboardInterrupt): mod.transactional_write([(a,'a','A'),(b,'b','B')])
+        self.assertEqual(a.read_text(),'a'); self.assertEqual(b.read_text(),'b')
+    def test_atomic_replace_failure_preserves_original(self):
+        from unittest.mock import patch
+        mod=self.module(); path=self.root/'original'; path.write_text('old')
+        with patch.object(mod.os,'replace',side_effect=OSError('injected')):
+            with self.assertRaises(OSError): mod.atomic_write(path,'new')
+        self.assertEqual(path.read_text(),'old'); self.assertFalse(list(self.root.glob('.*.tmp')))
+    def test_concurrent_recur_no_lost_increments(self):
+        ident=self.make(); self.cli('--base',self.base,'promote',ident)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _:self.cli('--base',self.base,'recur',ident),range(20)))
+        self.assertIn('- 复发次数: 21',self.text())
+        mod=self.module(); public=(self.shared/'public'/'LEARNINGS.md').read_text()
+        self.assertEqual(mod.block_for(self.text(),ident),mod.block_for(public,ident))
 
 if __name__=='__main__': unittest.main(verbosity=2)
