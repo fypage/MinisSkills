@@ -242,15 +242,27 @@ def add_note(block,heading,note):
     stamp=f"\n### {heading}\n- **时间**: {now()}\n- **说明**: {note}\n"
     return block.rstrip().removesuffix('---').rstrip()+stamp+'\n---\n'
 
+def field_pattern(field):
+    # Horizontal whitespace only; capture the whole value so invalid tails survive validation.
+    label=f'- {field}' if field in ('复发次数','最近出现') else f'**{field}**'
+    return re.compile(rf'^{re.escape(label)}:[ \t]*(.*)$',re.M)
+
+def field_value(block,field,default=None):
+    match=field_pattern(field).search(block)
+    return match.group(1) if match else default
+
+def replace_field(block,field,value):
+    label=f'- {field}' if field in ('复发次数','最近出现') else f'**{field}**'
+    return field_pattern(field).sub(lambda _: f'{label}: {value}',block,count=1)
+
 def promotion_of(block):
-    m=re.search(r'(?m)^\*\*提升\*\*: (\S+)',block)
-    if m: return m.group(1)
-    state=re.search(r'(?m)^\*\*状态\*\*: (\S+)',block)
-    return {'promoted_public':'public','promoted_memory':'memory'}.get(state.group(1),'none') if state else 'none'
+    value=field_value(block,'提升')
+    if value is not None: return value
+    return {'promoted_public':'public','promoted_memory':'memory'}.get(field_value(block,'状态'),'none')
 
 def set_promotion(block,value):
-    if re.search(r'(?m)^\*\*提升\*\*:',block): return re.sub(r'(?m)^\*\*提升\*\*: \S+',f'**提升**: {value}',block,1)
-    return re.sub(r'(?m)^(\*\*状态\*\*: \S+)$',rf'\1\n**提升**: {value}',block,1)
+    if field_pattern('提升').search(block): return replace_field(block,'提升',value)
+    return field_pattern('状态').sub(lambda m: m.group(0)+f'\n**提升**: {value}',block,count=1)
 
 def merge_promotion(current,requested):
     if requested=='none': return 'none'
@@ -262,13 +274,13 @@ def update(args):
     if not src: sys.exit(f'未找到条目：{args.id}')
     if not any((args.status,args.promotion,args.priority,args.note)): sys.exit('update 至少需要 --status、--promotion、--priority 或 --note')
     def apply(block):
-        legacy=re.search(r'(?m)^\*\*状态\*\*: (promoted_public|promoted_memory)',block)
-        if legacy:
-            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy.group(1)]))
-            block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
-        if args.status: block=re.sub(r'(?m)^\*\*状态\*\*: \S+',f'**状态**: {args.status}',block,1)
+        legacy=field_value(block,'状态')
+        if legacy in ('promoted_public','promoted_memory'):
+            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy]))
+            block=replace_field(block,'状态','pending')
+        if args.status: block=replace_field(block,'状态',args.status)
         if args.promotion: block=set_promotion(block,merge_promotion(promotion_of(block),args.promotion))
-        if args.priority: block=re.sub(r'(?m)^\*\*优先级\*\*: \S+',f'**优先级**: {args.priority}',block,1)
+        if args.priority: block=replace_field(block,'优先级',args.priority)
         return add_note(block,'更新记录',safe_text(args.note)) if args.note else block
     changed=[]
     with multi_lock(src.parent,PUBLIC):
@@ -292,10 +304,10 @@ def promote(args):
     if not src: sys.exit(f'未找到条目：{args.id}')
     init_base(PUBLIC); target=PUBLIC/src.name
     def marked(block):
-        legacy=re.search(r'(?m)^\*\*状态\*\*: (promoted_public|promoted_memory)',block)
-        if legacy:
-            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy.group(1)]))
-            block=re.sub(r'(?m)^\*\*状态\*\*: \S+','**状态**: pending',block,1)
+        legacy=field_value(block,'状态')
+        if legacy in ('promoted_public','promoted_memory'):
+            block=set_promotion(block,merge_promotion(promotion_of(block),{'promoted_public':'public','promoted_memory':'memory'}[legacy]))
+            block=replace_field(block,'状态','pending')
         current=promotion_of(block)
         value=merge_promotion(current,'public')
         block=set_promotion(block,value)
@@ -321,12 +333,12 @@ def recur(args):
     src=find_entry(args,args.id)
     if not src: sys.exit(f'未找到条目：{args.id}')
     def apply(block):
-        m=re.search(r'(?m)^- 复发次数: (\d+)',block); count=int(m.group(1))+1 if m else 2
-        if m: block=block[:m.start()]+f'- 复发次数: {count}'+block[m.end():]
-        else: block=block.rstrip().removesuffix('---').rstrip()+f'\n- 复发次数: {count}\n- 最近出现: {now()}\n\n---\n'
-        if not re.search(r'(?m)^- 最近出现:',block):
+        value=field_value(block,'复发次数'); count=int(value)+1 if value is not None else 2
+        if value is not None: block=replace_field(block,'复发次数',count)
+        else: block=block.rstrip().removesuffix('---').rstrip()+f'\n- 复发次数: {count}\n\n---\n'
+        if field_value(block,'最近出现') is None:
             block=block.rstrip().removesuffix('---').rstrip()+f'\n- 最近出现: {now()}\n\n---\n'
-        return re.sub(r'(?m)^- 最近出现: .*',f'- 最近出现: {now()}',block)
+        return replace_field(block,'最近出现',now())
     changed=[]
     with multi_lock(src.parent,PUBLIC):
         source=unique_block(src,args.id); final=apply(source); changes=[]
@@ -360,7 +372,7 @@ def review(args):
         except UnicodeError: invalid.append(str(p)); continue
         for ident,block in entries(text):
             duplicate.setdefault(ident,[]).append(str(p)); copies.setdefault(ident,[]).append((p,signature(block)))
-            state_match=re.search(r'(?m)^\*\*状态\*\*: (\S+)',block); state=state_match.group(1) if state_match else None; promotion=promotion_of(block)
+            state=field_value(block,'状态'); promotion=promotion_of(block)
             legacy_state=state in ('promoted_public','promoted_memory')
             problem=validate_entry(ident,block,p.name)
             if problem: malformed.append(f'{ident}@{p}({problem})')
@@ -402,7 +414,7 @@ def validate_entry(ident,block,filename):
     if expected_file_for_id(ident)!=filename: return 'ID 与文件类型不匹配'
     values={}
     for field in ('优先级','状态','提升'):
-        found=re.findall(rf'(?m)^\*\*{field}\*\*:[ \t]*(.*)$',block)
+        found=field_pattern(field).findall(block)
         if field in ('优先级','状态') and not found: return f'缺少必要字段 {field}'
         if len(found)>1: return f'字段重复 {field}'
         values[field]=found[0] if found else 'none'
@@ -410,7 +422,7 @@ def validate_entry(ident,block,filename):
     if values['状态'] not in VALID_STATES and values['状态'] not in ('promoted_public','promoted_memory'): return '状态值无效'
     if values['提升'] not in VALID_PROMOTIONS: return '提升值无效'
     for field in ('复发次数','最近出现'):
-        found=re.findall(rf'(?m)^- {field}:[ \t]*(.*)$',block)
+        found=field_pattern(field).findall(block)
         if len(found)>1: return f'字段重复 {field}'
         if found and (not found[0] or (field=='复发次数' and not re.fullmatch(r'[1-9][0-9]{0,8}',found[0]))): return f'{field}值无效'
     return None
@@ -443,7 +455,7 @@ def migrate(args):
     print(f'迁移完成：新增 {copied} 条；旧目录保留兼容')
 
 def parser():
-    p=argparse.ArgumentParser(description='Self Improving Agent v3.4.0')
+    p=argparse.ArgumentParser(description='Self Improving Agent v3.4.1')
     g=p.add_mutually_exclusive_group(); g.add_argument('--base',type=Path); g.add_argument('--project',type=Path); g.add_argument('--public',action='store_true'); g.add_argument('--skill',action='store_true'); g.add_argument('--workspace',action='store_true',help=argparse.SUPPRESS)
     p.add_argument('--source',default='conversation'); sub=p.add_subparsers(dest='cmd',required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('migrate')
