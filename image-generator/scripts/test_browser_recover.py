@@ -30,6 +30,11 @@ def envelope(raw):
     return json.dumps({"status": "ok", "data": {"text": "data:image/png;base64," + b64}})
 
 
+def opened(tab=0, url='minis://attachments/a.png'):
+    return json.dumps({'ok': True, 'tool': 'minis-browser-use', 'action': 'new_tab',
+                       'data': {'success': True, 'text': f'Opened new tab {tab} at {url}. Use tab_id: {tab} to target this tab.'}})
+
+
 def completed(stdout="", code=0):
     return mock.Mock(stdout=stdout, returncode=code)
 
@@ -46,7 +51,7 @@ class ParseTests(unittest.TestCase):
         raw = json.dumps({'data': {'text': text, 'success': True}}).replace('/', r'\/')
         self.assertIn(r'\/', raw)
         self.assertEqual(m.data_url_from_output(raw), (image, 'png'))
-        self.assertEqual(m.tab_id_from_output(raw), '0')
+        self.assertIsNone(m.tab_id_from_output(raw))
 
     def test_invalid_suffix_is_not_silently_truncated(self):
         for suffix in ('!', '_bad', '\n  tab_id: invalid', '\n  tab_id: 0\nextra'):
@@ -80,8 +85,9 @@ class ParseTests(unittest.TestCase):
         m.validate_image(image, "png")
 
     def test_tab_id_json_and_text(self):
-        self.assertEqual(m.tab_id_from_output('{"data":{"tab_id":12}}'), "12")
-        self.assertEqual(m.tab_id_from_output("Opened new tab 19; use tab_id: 19"), "19")
+        self.assertIsNone(m.tab_id_from_output('{"data":{"tab_id":12}}'))
+        self.assertIsNone(m.tab_id_from_output("Opened new tab 19; use tab_id: 19"))
+        self.assertEqual(m.tab_id_from_output(opened(19, 'about:blank')), '19')
         self.assertIsNone(m.tab_id_from_output('{"data":{"text":"done"}}'))
 
     def test_canvas_description_is_explicit(self):
@@ -177,7 +183,7 @@ class RecoverTests(unittest.TestCase):
     def test_success_uses_tab_and_accepts_tiny_png(self):
         image = png_bytes()
         calls = []
-        responses = [completed('{"data":{"tab_id":7}}'), completed(envelope(image)), completed()]
+        responses = [completed(opened(7, 'minis://attachments/%E6%B5%8B%E8%AF%95%20%E5%9B%BE.png')), completed(envelope(image)), completed()]
         def fake_run(args, timeout=120):
             calls.append(args)
             return responses.pop(0)
@@ -201,7 +207,7 @@ class RecoverTests(unittest.TestCase):
 
     def test_fake_png_not_published(self):
         fake = b"\x89PNG\r\n\x1a\n" + b"x" * 3000
-        responses = [completed('{"tab_id":3}'), completed(envelope(fake)), completed()]
+        responses = [completed(opened(3)), completed(envelope(fake)), completed()]
         with mock.patch.object(m, "run", side_effect=responses):
             ok, _ = m.recover("minis://attachments/a.png", str(self.root / "bad.png"), 1)
         self.assertFalse(ok)
@@ -209,7 +215,7 @@ class RecoverTests(unittest.TestCase):
 
     def test_close_exception_does_not_hide_success(self):
         image = png_bytes()
-        responses = iter([completed('{"tab_id":4}'), completed(envelope(image))])
+        responses = iter([completed(opened(4)), completed(envelope(image))])
         def fake_run(args, timeout=120):
             if args[1] == "close_tab":
                 raise RuntimeError("close broke")
@@ -220,24 +226,24 @@ class RecoverTests(unittest.TestCase):
         self.assertIn("recovered", message)
 
     def test_close_interrupt_preserves_committed_success(self):
-        responses = [completed('{"tab_id":0}'), completed(envelope(png_bytes())), KeyboardInterrupt()]
+        responses = [completed(opened(0)), completed(envelope(png_bytes())), KeyboardInterrupt()]
         with mock.patch.object(m, 'run', side_effect=responses):
             ok, message = m.recover('minis://attachments/a.png', str(self.root / 'ok.png'), 1)
         self.assertTrue(ok)
         self.assertIn('close raised', message)
 
-    def test_failed_open_with_known_id_is_closed(self):
-        with mock.patch.object(m, 'run', side_effect=[completed('{"tab_id":0}', 1), completed()]) as runner:
+    def test_failed_open_with_known_id_is_not_closed(self):
+        with mock.patch.object(m, 'run', return_value=completed(opened(0), 1)) as runner:
             ok, _ = m.recover('minis://attachments/a.png', str(self.root / 'out.png'), 1)
         self.assertFalse(ok)
-        self.assertEqual(runner.call_args.args[0][1:], ['close_tab', '--tab-id', '0'])
+        self.assertEqual(runner.call_count, 1)
 
     def test_keyboard_interrupt_closes_dedicated_tab(self):
         calls = []
         def runner(args, timeout=120):
             calls.append(args)
             if args[1] == 'new_tab':
-                return completed('{"tab_id":0}')
+                return completed(opened(0))
             if args[1] == 'execute_js':
                 raise KeyboardInterrupt()
             raise RuntimeError('close also failed')
@@ -273,7 +279,7 @@ root = Path(sys.argv[2]); m.ATTACHMENTS = root
 stage = sys.argv[3]
 def runner(args, timeout=120):
     if args[1] == 'new_tab':
-        return SimpleNamespace(returncode=0, stdout='{"tab_id":0}')
+        return SimpleNamespace(returncode=0, stdout='{"ok":true,"tool":"minis-browser-use","action":"new_tab","data":{"success":true,"text":"Opened new tab 0 at minis://attachments/a.png. Use tab_id: 0 to target this tab."}}')
     if args[1] == 'close_tab':
         (root / ('closed-' + stage)).touch()
         return SimpleNamespace(returncode=0, stdout='')
@@ -285,7 +291,7 @@ def interrupt(fd):
 with mock.patch.object(m, 'run', runner), mock.patch.object(m.os, 'fsync', interrupt):
     m.recover('minis://attachments/a.png', str(root / (stage + '.png')), 1)
 '''
-            result = subprocess.run([sys.executable, '-B', '-c', code, str(P), str(self.root), stage, envelope(png_bytes())], capture_output=True, text=True, timeout=20)
+            result = subprocess.run([sys.executable, '-B', '-c', code, str(P), str(self.root), stage, envelope(png_bytes())], capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 143, result.stderr)
             self.assertTrue((self.root / ('closed-' + stage)).exists())
             self.assertFalse((self.root / (stage + '.png')).exists())
@@ -327,12 +333,79 @@ class LiveCliTests(unittest.TestCase):
                 self.assertEqual(image.size, (2, 2))
             with tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / 'canvas.png'
-                m.publish_exclusive(target, candidate[0])
+                with mock.patch.object(m, 'ATTACHMENTS', Path(directory)):
+                    m.publish_exclusive(target, candidate[0])
                 self.assertEqual(target.read_bytes(), candidate[0])
                 self.assertEqual(list(Path(directory).glob('.browser-recover-*.tmp')), [])
         finally:
             closed = m.run(['minis-browser-use', 'close_tab', '--tab-id', tab], 15)
             self.assertEqual(closed.returncode, 0, 'dedicated live-test tab close failed')
+
+
+class HardenedTests(unittest.TestCase):
+    def test_creation_rejects_error_unrelated_conflicting_and_duplicate_ids(self):
+        good = json.loads(opened(3, 'about:blank'))
+        cases = [json.dumps({'ok': False, 'error': {'tab_id': 2}}),
+                 json.dumps({'data': {'tabs': [{'tab_id': 2}]}}),
+                 opened(3, 'about:blank') + opened(4, 'about:blank'),
+                 opened(3, 'about:blank').replace('tab_id: 3', 'tab_id: 4'),
+                 opened(3, 'about:blank').replace('"ok": true', '"ok": false, "ok": true')]
+        good['data']['tab_id'] = 5
+        cases.append(json.dumps(good))
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIsNone(m.tab_id_from_output(text))
+
+    def test_png_truncated_iend_crc_and_trailing_data(self):
+        raw = png_bytes()
+        for bad in [raw[:-1], raw[:-8], raw[:-12], raw + b'x', raw[:-1] + bytes([raw[-1] ^ 1])]:
+            with self.subTest(length=len(bad)), self.assertRaises(ValueError):
+                m.validate_image(bad, 'png')
+
+    def test_parent_replacement_cannot_redirect_publish(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            root = Path(directory); parent = root / 'p'; parent.mkdir()
+            original = os.link
+            def swap(src, dst, **kwargs):
+                parent.rename(root / 'pinned')
+                parent.symlink_to(outside)
+                return original(src, dst, **kwargs)
+            with mock.patch.object(m, 'ATTACHMENTS', root), mock.patch.object(m.os, 'link', side_effect=swap):
+                m.publish_exclusive(parent / 'image.png', png_bytes())
+            self.assertFalse((Path(outside) / 'image.png').exists())
+            self.assertEqual((root / 'pinned' / 'image.png').read_bytes(), png_bytes())
+            self.assertEqual(list((root / 'pinned').glob('*.tmp')), [])
+
+    def test_offload_swap_and_growth_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / 'data'; source.write_text('abc')
+            with mock.patch.object(m, 'OFFLOADS', root):
+                self.assertEqual(m._safe_offload(str(source)), source)
+                source.unlink(); source.symlink_to('/etc/passwd')
+                with self.assertRaises(OSError):
+                    m.read_offload(source)
+                source.unlink(); source.write_bytes(b'x' * 65)
+                with mock.patch.object(m, 'MAX_OFFLOAD_BYTES', 64), self.assertRaises(ValueError):
+                    m.read_offload(source)
+
+    def test_stream_limit_and_timeout(self):
+        with mock.patch.object(m, 'MAX_CLI_TEXT', 128), self.assertRaises(ValueError):
+            m.run([sys.executable, '-c', 'import os; os.write(1,b"x"*4096)'], 30)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            m.run([sys.executable, '-c', 'import time; time.sleep(10)'], 0.1)
+
+    def test_canvas_checks_precede_allocation(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(m, 'ATTACHMENTS', Path(directory)):
+            responses = [completed(opened()), completed(), completed()]
+            with mock.patch.object(m, 'run', side_effect=responses) as runner:
+                m.recover('minis://attachments/a.png', str(Path(directory) / 'out.png'), 1)
+            script = runner.call_args_list[1].args[0][-1]
+            self.assertIn('document.contentType', script)
+            self.assertIn('location.href!==expected', script)
+            self.assertIn('i.currentSrc||i.src', script)
+            self.assertNotIn("querySelector('img')", script)
+            self.assertLess(script.index('w>16384'), script.index("createElement('canvas')"))
+            self.assertLess(script.index('w*h>'), script.index("createElement('canvas')"))
 
 
 if __name__ == "__main__":

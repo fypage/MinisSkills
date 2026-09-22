@@ -62,7 +62,9 @@ minis-model-use list --modality image_output
 
 此适配只在运行时供应商标签精确匹配时启用。仅支持 n=1；size 作为提示词并警告，不保证像素；非默认 quality、resolution、response-format 及 extra-body 拒绝。默认 response-format=url 也不控制工具响应格式。若供应商改名或协议升级，应先做一次受控验证，再更新脚本与测试。
 
-## 包装器能力边界（v1.2）
+## 包装器能力边界（v1.2.1）
+
+以下是实现契约与验收目标，不代表本次修复已通过全部验收；以离线回归结果及 `evals/acceptance.md` 的工具轨迹为证。远端在线、计费、实际参数支持与视觉效果均不能由本地测试证明。
 
 - OpenAI size须为auto或正整数WxH；quality允许auto/low/medium/high/standard/hd，未知值本地拒绝。这是语法门禁，不证明每个供应商支持所有枚举。
 - Gemini像素尺寸只在精确约分后属于支持比例时转换，不再容差吸附。
