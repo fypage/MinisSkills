@@ -344,12 +344,12 @@ class RetentionTests(SafetyTests):
             return self.result()
         real_link = m.os.link
         count = 0
-        def link(src, dst):
+        def link(src, dst, **kwargs):
             nonlocal count
             count += 1
             if count == 2:
                 raise OSError('mock failure')
-            real_link(src, dst)
+            real_link(src, dst, **kwargs)
         with patch.object(m.os, 'link', side_effect=link), self.assertRaises(OSError):
             self.run_job(cli, n=2)
         rec = self.journal()
@@ -362,9 +362,11 @@ class RetentionTests(SafetyTests):
             self.image(Path(cmd[-1]))
             return self.result()
         real_link = m.os.link
-        def link(src, dst):
-            Path(dst).write_bytes(b'existing')
-            real_link(src, dst)
+        def link(src, dst, src_dir_fd=None, dst_dir_fd=None, **kwargs):
+            fd = m.os.open(dst, m.os.O_WRONLY | m.os.O_CREAT | m.os.O_NOFOLLOW, dir_fd=dst_dir_fd)
+            m.os.write(fd, b'existing')
+            m.os.close(fd)
+            real_link(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd, **kwargs)
         with patch.object(m.os, 'link', side_effect=link), self.assertRaises(FileExistsError):
             self.run_job(cli)
         self.assertEqual((self.attach / 'out.png').read_bytes(), b'existing')
@@ -375,7 +377,7 @@ class RetentionTests(SafetyTests):
                'minis://attachments/%2e%2e/a', 'minis://attachments/a?key=PRIVATE',
                'minis://attachments/a#PRIVATE', 'minis://attachments/%252e%252e/a',
                'minis://attachments/a%00b', 'minis://attachments/a%zz']
-        got = m.recovery_candidates([good, *bad])
+        got = m.recovery_candidates({'media_files': [good, *bad]})
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]['minis_url'], good)
         self.assertFalse(got[0]['verified'])
@@ -408,6 +410,140 @@ class RetentionTests(SafetyTests):
     def test_exact_ratio_not_common_approximation(self):
         self.assertEqual(m.aspect_from_dims((960, 1672)), '120:209')
         self.assertEqual(m.approximate_aspect((960, 1672)), '约 9:16')
+
+
+class AuditRegressionTests(SafetyTests):
+    def test_post_submit_oserror_retains_media(self):
+        def cli(cmd, **kwargs):
+            self.image(Path(cmd[-1]))
+            raise OSError('PRIVATE native-offload failure')
+        with self.assertRaises(SystemExit) as exc:
+            self.run_job(cli)
+        self.assertEqual(exc.exception.code, 3)
+        rec = self.journal()
+        self.assertEqual(rec['status'], 'ambiguous')
+        self.assertEqual(rec['reason'], 'cli_os_error')
+        self.assertTrue(rec['stage_retained'])
+        self.assertTrue(rec['raw_response_preserved'])
+        self.assertTrue(m.image_dimensions(rec['verified_media'][0]['path']))
+
+    def test_start_failure_before_submit(self):
+        real_run = m.subprocess.run
+        def run(cmd, **kwargs):
+            if cmd[:2] == ['minis-model-use', 'run']:
+                raise FileNotFoundError('PRIVATE')
+            return real_run(cmd, **kwargs)
+        with patch.object(m.subprocess, 'run', side_effect=run), self.assertRaises(SystemExit):
+            m.run_model_use({'prompt': 'PRIVATE'}, self.attach / 'out.png', 'p', 'x', prompt_text='PRIVATE')
+        rec = self.journal()
+        self.assertEqual(rec['status'], 'failed_pre_submit')
+        self.assertFalse(rec['stage_retained'])
+        self.assertFalse(rec['raw_response_preserved'])
+
+    def test_journal_replace_failure_preserves_previous(self):
+        journal = self.work / 'image_job_test.json'
+        m.save_journal(journal, {'status': 'submitted', 'prompt': 'PRIVATE'})
+        real_replace = m.os.replace
+        def replace(*args, **kwargs):
+            raise OSError('PRIVATE replace failure')
+        with patch.object(m.os, 'replace', side_effect=replace), self.assertRaises(OSError):
+            m.save_journal(journal, {'status': 'ambiguous'})
+        self.assertEqual(json.loads(journal.read_text())['status'], 'submitted')
+        self.assertFalse(list(self.work.glob('.image_journal_*')))
+
+    def test_recovery_rejects_arbitrary_echoes(self):
+        leaked = 'minis://attachments/echo.png'
+        payload = {'request': {'prompt': leaked}, 'error': leaked,
+                   'message': leaked, 'stdout': leaked,
+                   'response': {'request': {'url': leaked},
+                                'data': {'nested': leaked},
+                                'media_files': ['minis://attachments/real.png']}}
+        got = m.recovery_candidates(payload)
+        self.assertEqual([item['minis_url'] for item in got], ['minis://attachments/real.png'])
+
+    def test_recovery_budget_and_depth(self):
+        nested = ['minis://attachments/deep.png']
+        for _ in range(10):
+            nested = {'data': nested}
+        self.assertEqual(m.recovery_candidates({'media_files': nested}), [])
+        huge = {'media_files': [f'minis://attachments/{index}.png' for index in range(300)]}
+        self.assertLessEqual(len(m.recovery_candidates(huge)), 256)
+
+    def test_inspection_limit_and_unclassified_content(self):
+        stage = self.attach / '.image_job_limit'
+        stage.mkdir()
+        for index in range(257):
+            (stage / f'{index:03d}.bin').write_bytes(b'not-image')
+        record = {}
+        self.assertEqual(m.inspect_stage(stage, record), [])
+        self.assertTrue(record['inspection_limit_reached'])
+        self.assertTrue(record['unclassified_stage_content'])
+        self.assertEqual(len(list(stage.iterdir())), 257)
+
+    def test_success_retains_unclassified_files(self):
+        def cli(cmd, **kwargs):
+            output = Path(cmd[-1])
+            self.image(output)
+            (output.parent / 'unknown.bin').write_bytes(b'unknown')
+            return self.result()
+        result = self.run_job(cli)
+        self.assertTrue(result['stage_retained'])
+        self.assertTrue((Path(result['stage_path']) / 'unknown.bin').exists())
+
+    def test_success_retains_scan_limit(self):
+        def cli(cmd, **kwargs):
+            self.image(Path(cmd[-1]))
+            return self.result()
+        original = m.inspect_stage
+        def limited(stage, record):
+            images = original(stage, record)
+            record['inspection_limit_reached'] = True
+            return images
+        with patch.object(m, 'inspect_stage', side_effect=limited):
+            result = self.run_job(cli)
+        self.assertTrue(result['stage_retained'])
+        self.assertTrue(Path(result['stage_path']).exists())
+
+    def test_exif_orientation_is_corrected(self):
+        source = self.attach / 'oriented.jpg'
+        exif = m.Image.Exif()
+        exif[0x0112] = 6
+        m.Image.new('RGB', (20, 10), 'blue').save(source, 'JPEG', exif=exif)
+        prepared = m.prepare_reference_image(source, max_side=100)
+        with m.Image.open(prepared) as image:
+            self.assertEqual(image.size, (10, 20))
+        if prepared.resolve() != source.resolve():
+            prepared.unlink()
+
+    def test_unknown_raw_response_is_not_false(self):
+        def cli(cmd, **kwargs):
+            self.image(Path(cmd[-1]))
+            return self.result()
+        def retain(path, ignore_errors=False):
+            raise OSError('retain stage')
+        with patch.object(m.shutil, 'rmtree', side_effect=retain):
+            result = self.run_job(cli)
+        self.assertTrue(result['raw_response_preserved'])
+        self.assertTrue(self.journal()['stage_retained'])
+
+    def test_list_models_exception_is_redacted(self):
+        with patch.object(m.subprocess, 'run', side_effect=OSError('PRIVATE credential')):
+            with self.assertRaises(SystemExit) as exc:
+                m.list_models_cli()
+        self.assertEqual(exc.exception.code, 1)
+        self.assertNotIn('PRIVATE', self.stderr.getvalue())
+
+    def test_symlink_parent_cannot_escape(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (self.attach / 'escape').symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(SystemExit):
+            m.validate_output_path(self.attach / 'escape' / 'out.png')
+        self.assertFalse((outside / 'out.png').exists())
+        stage = m.safe_stage('race')
+        self.assertEqual(stage.parent, self.attach)
+        self.assertFalse(stage.is_symlink())
+        stage.rmdir()
 
 
 class SignalProcessTests(unittest.TestCase):

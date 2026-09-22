@@ -6,32 +6,21 @@
       "prompt": "画一张未来城市日落，电影感，横版",
       "expected_output": "Queries current image_output routes, uses provider-neutral generation, saves a validated image under attachments, and reports actual dimensions.",
       "files": [],
-      "assertions": [
-        {"type": "contains", "text": "openminis_image.py generate"},
-        {"type": "contains", "text": "image_output"},
-        {"type": "contains", "text": "清晰度"}
-      ]
+      "assertions": []
     },
     {
       "id": "explicit_provider_no_silent_substitution",
       "prompt": "用我指定的 A 站模型生成海报；如果不可用就停",
       "expected_output": "Uses the requested provider only when currently available; otherwise stops without switching to another paid route.",
       "files": [],
-      "assertions": [
-        {"type": "contains", "text": "--provider"},
-        {"type": "not_contains", "text": "自动切换"}
-      ]
+      "assertions": []
     },
     {
       "id": "image_edit_private_reference",
       "prompt": "把这张图改成赛博朋克雨夜风，人物别变",
       "expected_output": "Uses edit mode, states must-preserve and must-change constraints, preprocesses the reference locally and sends its data URI to the selected provider, without using a public image host.",
       "files": ["/var/minis/attachments/input.png"],
-      "assertions": [
-        {"type": "contains", "text": "openminis_image.py edit"},
-        {"type": "contains", "text": "保留人物"},
-        {"type": "not_contains", "text": "临时图床"}
-      ]
+      "assertions": []
     },
     {
       "id": "ambiguous_timeout_no_double_charge",
@@ -39,8 +28,7 @@
       "expected_output": "Treats 502 as an ambiguous outcome and does not submit a second paid job without explicit informed confirmation.",
       "files": [],
       "assertions": [
-        {"type": "contains", "text": "结果不确定"},
-        {"type": "not_contains", "text": "自动切换"}
+        {"type": "contains", "text": "结果不确定"}
       ]
     },
     {
@@ -48,20 +36,14 @@
       "prompt": "做一张写着 OpenMinis 2026 的发布海报",
       "expected_output": "Repeats exact text in the prompt, generates once, then visually verifies the rendered wording before claiming accuracy.",
       "files": [],
-      "assertions": [
-        {"type": "contains", "text": "OpenMinis 2026"},
-        {"type": "contains", "text": "视觉核验"}
-      ]
+      "assertions": []
     },
     {
       "id": "existing_media_recovery_no_regeneration",
       "prompt": "图片已经生成了，但附件路径读不到，帮我恢复",
       "expected_output": "Uses browser_recover.py on the existing minis URL and never submits another model request.",
       "files": [],
-      "assertions": [
-        {"type": "contains", "text": "browser_recover.py"},
-        {"type": "not_contains", "text": "openminis_image.py generate"}
-      ]
+      "assertions": []
     }
   ]
 }

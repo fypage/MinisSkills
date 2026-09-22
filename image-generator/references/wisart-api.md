@@ -4,7 +4,7 @@
 
 该历史路径使用 OpenMinis `minis-model-use`；供应商已在 App 中配置时无需读取原始 API Key。
 
-## OpenMinis model-use verified formats
+## Historical OpenMinis model-use formats (archived examples, not current wrapper inputs)
 
 Text-to-image request body:
 
@@ -37,7 +37,9 @@ Image-to-image/edit request body verified with WisArt through model-use:
 
 Use top-level `images: [data_uri]` for model-use. Do not default to `/images/edits` for this path.
 
-## Current API boundaries
+## Historical API boundaries (archived 2026-07-17)
+
+以下是归档时的供应商口径，不是当前服务承诺，也不是 v1.2.1 包装器的输入契约。上方请求示例仅保留历史恢复语境；当前 OpenAI 包装器只接受 `auto` 或正整数 `WxH`，不接受 `9:16` 等比例字符串，`resolution` 走经核对的扩展字段。不得直接照抄历史请求发起新任务。运行时模型列表只能证明路由已配置，不能证明远端在线或参数受支持。
 
 - `/v1/images/generations`: `n=1–5`; `response_format=url|b64_json`; maintenance returns HTTP 503.
 - `/v1/images/edits`: multipart `image` may repeat, or JSON may use `images`; supports at most 16 JPG/JPEG/PNG/WebP/GIF references.
@@ -95,7 +97,7 @@ Prefer actual saved image dimensions over requested resolution tier:
 站点：`智画创`
 模型：`gpt-image-2`
 清晰度：`941x1672`
-比例：`9:16`
+比例：`941:1672`（精确）；约 `9:16`（近似，不能作为严格画幅验收）
 质量：`quality=auto`
 耗时：`38s`
 文件路径：`/var/minis/attachments/xxx.png`

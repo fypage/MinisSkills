@@ -21,7 +21,7 @@ from functools import wraps
 from contextlib import contextmanager
 from urllib.parse import quote, unquote, urlsplit
 try:
-    from PIL import Image
+    from PIL import Image, ImageOps
 except Exception:
     Image = None
 from pathlib import Path
@@ -196,16 +196,62 @@ def minis_url(path):
     return "minis://attachments/" + quote(relative.as_posix(), safe="/")
 
 
+@contextmanager
+def secure_parent(path, root, create=False):
+    """Anchor traversal at / and use no-follow directory FDs for every component."""
+    path, root = Path(os.path.abspath(path)), Path(os.path.abspath(root))
+    relative = path.relative_to(root)
+    if not relative.parts or '..' in relative.parts:
+        raise ValueError('Invalid contained file path')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parent.parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd, path.name
+    finally:
+        os.close(fd)
+
+
 def validate_output_path(path):
-    original = Path(path)
-    p = original.resolve()
-    root = ATTACHMENTS.resolve()
-    if p == root or root not in p.parents:
-        die("--output must be a file under /var/minis/attachments")
-    if original.is_symlink() or p.exists():
-        die("--output already exists; refusing to overwrite")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
+    p = Path(os.path.abspath(path))
+    try:
+        with secure_parent(p, ATTACHMENTS, create=True) as (fd, name):
+            try:
+                os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return p
+    except (OSError, ValueError):
+        die('--output must use real directories under /var/minis/attachments')
+    die('--output already exists; refusing to overwrite')
+
+
+def _contained(path, root):
+    path, root = Path(os.path.abspath(path)), Path(os.path.abspath(root))
+    relative = path.relative_to(root)
+    if '..' in relative.parts:
+        raise ValueError('Invalid contained file path')
+    return path, relative
+
+
+def safe_stage(job_id):
+    """Create a private task directory using the pinned attachment root."""
+    name = f'.image_job_{job_id}_' + uuid4().hex[:8]
+    with secure_parent(ATTACHMENTS / name, ATTACHMENTS) as (root_fd, _):
+        os.mkdir(name, 0o700, dir_fd=root_fd)
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        os.fchmod(child, 0o777)
+        os.close(child)
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+    os.close(fd)
+    return ATTACHMENTS / name
 
 
 def prepare_reference_image(path, max_side=1024, jpeg_quality=85):
@@ -220,6 +266,9 @@ def prepare_reference_image(path, max_side=1024, jpeg_quality=85):
     try:
         with Image.open(p) as img:
             img.load()
+            img = ImageOps.exif_transpose(img)
+            if img is None:
+                raise ValueError('EXIF orientation correction failed')
             has_alpha = img.mode in ("RGBA", "LA") or "transparency" in img.info
             img.thumbnail((max_side, max_side))
             out = out if has_alpha else out.with_suffix(".jpg")
@@ -394,14 +443,26 @@ def controlled_termination(func):
 def recovery_candidates(objects):
     """Only canonical attachment URLs, with no query/credentials/traversal."""
     found = set()
-    def walk(value):
+    budget = [256]
+    def walk(value, depth=0, media=False):
+        if depth > 8 or budget[0] <= 0:
+            return
+        budget[0] -= 1
         if isinstance(value, dict):
-            for item in value.values():
-                walk(item)
+            for key, item in value.items():
+                if key in {'media_files', 'media', 'images', 'attachments'}:
+                    walk(item, depth + 1, True)
+                elif key in {'url', 'minis_url', 'path', 'file_path', 'local_path'}:
+                    if isinstance(item, str):
+                        walk(item, depth + 1, True)
+                elif key in {'result', 'response', 'data'}:
+                    walk(item, depth + 1, False)
         elif isinstance(value, list):
-            for item in value:
-                walk(item)
-        elif isinstance(value, str) and value.startswith('minis://attachments/'):
+            for item in value[:256]:
+                if budget[0] <= 0:
+                    return
+                walk(item, depth + 1, media)
+        elif media and isinstance(value, str) and value.startswith('minis://attachments/'):
             try:
                 parts = urlsplit(value)
                 path = unquote(parts.path, errors='strict')
@@ -423,16 +484,43 @@ def recovery_candidates(objects):
 
 
 def save_journal(journal, record):
-    with journal.open('w', encoding='utf-8') as stream:
-        journal.chmod(0o600)
-        json.dump(record, stream, ensure_ascii=False, indent=2)
-        stream.flush()
-        os.fsync(stream.fileno())
+    # Serialize before touching the existing journal; failed writes preserve it.
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode('utf-8')
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    with secure_parent(journal, WORKSPACE) as (directory, name):
+        temporary = '.image_journal_' + uuid4().hex
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        except BaseException:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def _exists_at(directory, name):
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def cleanup_action(record, operation, path, action):
     try:
+        if operation == 'remove_stage':
+            record['raw_response_preserved'] = True
         action()
+        if operation == 'remove_stage':
+            record['raw_response_preserved'] = False
         return True
     except Exception as exc:
         record.setdefault('cleanup_errors', []).append(
@@ -450,6 +538,8 @@ def media_info(path, dims, mime):
 def inspect_stage(stage, record):
     """Bounded inspection, never follow directory or file symlinks."""
     images, hashes = [], set()
+    record['unclassified_stage_content'] = False
+    record['inspection_limit_reached'] = False
     pending, inspected = [stage], 0
     while pending and inspected < 256:
         directory = pending.pop()
@@ -459,11 +549,13 @@ def inspect_stage(stage, record):
                 if inspected > 256:
                     break
                 if entry.is_symlink():
+                    record['unclassified_stage_content'] = True
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(Path(entry.path))
                     continue
                 if not entry.is_file(follow_symlinks=False) or entry.stat().st_size > 100 * 1024 * 1024:
+                    record['unclassified_stage_content'] = True
                     continue
                 candidate = Path(entry.path)
                 dims = image_dimensions(candidate)
@@ -473,34 +565,60 @@ def inspect_stage(stage, record):
                     if digest not in hashes:
                         hashes.add(digest)
                         images.append((candidate, dims, mime))
+                else:
+                    record['unclassified_stage_content'] = True
     images.sort(key=lambda item: (item[0] != stage / 'result.png', str(item[0])))
     record['verified_media'] = [media_info(*item) for item in images]
-    record['inspection_limit_reached'] = inspected >= 256
+    if pending or inspected >= 256:
+        record['inspection_limit_reached'] = True
     return images
 
 
 def atomic_publish(candidate, target, dims, record, journal):
-    """Same-filesystem hard-link commit is atomic and never replaces a name."""
-    fd, name = tempfile.mkstemp(prefix='.image_publish_', dir=target.parent)
-    temp = Path(name)
-    try:
-        with os.fdopen(fd, 'wb') as dst, candidate.open('rb') as src:
-            shutil.copyfileobj(src, dst)
-            dst.flush()
-            os.fsync(dst.fileno())
-        if image_dimensions(temp) != dims or temp.read_bytes() != candidate.read_bytes():
-            raise ValueError('Publication verification failed')
-        temp.chmod(0o644)
-        # Block TERM across commit + per-image journal so the link is accounted for.
-        with block_termination():
-            os.link(temp, target)
-            info = media_info(target, dims, detect_image_mime(target))
-            record['images'].append(info)
-            save_journal(journal, record)
-        return info
-    finally:
-        cleanup_action(record, 'remove_publication_temp', temp,
-                       lambda: temp.unlink(missing_ok=True))
+    """Pin both parents; linkat commits a fully verified file without overwrite."""
+    with secure_parent(target, ATTACHMENTS) as (directory, name), \
+            secure_parent(candidate, ATTACHMENTS) as (source_dir, source_name):
+        temporary = '.image_publish_' + uuid4().hex
+        fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        try:
+            source_fd = os.open(source_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_dir)
+            with os.fdopen(fd, 'w+b') as dst, os.fdopen(source_fd, 'rb') as src:
+                shutil.copyfileobj(src, dst)
+                dst.flush()
+                os.fsync(dst.fileno())
+                dst.seek(0)
+                if image_dimensions(dst) != dims:
+                    raise ValueError('Publication verification failed')
+                dst.seek(0)
+                data = dst.read()
+                src.seek(0)
+                if data != src.read():
+                    raise ValueError('Publication verification failed')
+                mime = ('image/png' if data.startswith(b'\x89PNG') else
+                        'image/jpeg' if data.startswith(b'\xff\xd8\xff') else
+                        'image/webp' if data[:4] == b'RIFF' else 'image/gif')
+                os.fchmod(dst.fileno(), 0o644)
+            # Recheck the path binding before commit; never follow a substituted parent.
+            with secure_parent(target, ATTACHMENTS) as (current, _):
+                if os.fstat(current) != os.fstat(directory):
+                    raise OSError('Publication directory changed')
+            with block_termination():
+                os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+                relative = Path(target).relative_to(Path(os.path.abspath(ATTACHMENTS)))
+                info = {'path': str(target), 'minis_url': 'minis://attachments/' +
+                        quote(relative.as_posix(), safe='/'), 'verified': True,
+                        'pixel_size': f'{dims[0]}x{dims[1]}', 'aspect': aspect_from_dims(dims),
+                        'aspect_exact': aspect_from_dims(dims),
+                        'aspect_approximate': approximate_aspect(dims), 'mime': mime}
+                record['images'].append(info)
+                os.fsync(directory)
+                save_journal(journal, record)
+            return info
+        finally:
+            cleanup_action(record, 'remove_publication_temp', target.parent / temporary,
+                           lambda: os.unlink(temporary, dir_fd=directory))
 
 
 @contextmanager
@@ -522,25 +640,31 @@ def run_model_use(payload, output, provider, model, timeout=900, prompt_text="")
     job_id = uuid4().hex
     req = WORKSPACE / f"image_model_use_{job_id}.json"
     journal = WORKSPACE / f"image_job_{job_id}.json"
-    stage = Path(tempfile.mkdtemp(prefix=f".image_job_{job_id}_", dir=ATTACHMENTS))
-    # Native-offload runs under a different UID: short-lived readable request
-    # and writable task directory are required on some Android versions.
-    stage.chmod(0o777)
+    stage = safe_stage(job_id)
+    # Native-offload runs under a different UID: the short-lived request is
+    # readable and the task directory is created mode 0777.  This is a known
+    # compatibility tradeoff and is never widened to the attachment root.
     started = time.time()
     requested_n = payload.get("n", payload.get("generation_config", {}).get("number_of_images", 1))
     record = {"status": "preparing", "model": model, "provider": provider,
               "prompt_sha256": hashlib.sha256(prompt_text.encode()).hexdigest(),
               "requested_n": requested_n, "request_file_removed": False,
-              "raw_response_preserved": False}
+              "raw_response_preserved": None}
     record.update(job_id=job_id, stage_path=str(stage), images=[], verified_media=[],
                   recovery_candidates=[], cleanup_errors=[], remote_cancelled=False)
     result = None
     objects = []
     diagnostic_stage = 'preparation'
     try:
-        with req.open("x", encoding="utf-8") as stream:
-            req.chmod(0o644)
-            json.dump(payload, stream, ensure_ascii=False)
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+        with secure_parent(req, WORKSPACE) as (directory, name):
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(payload, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
         cmd = ["minis-model-use", "run", "--model", model]
         if provider:
             cmd += ["--provider", provider]
@@ -557,10 +681,16 @@ def run_model_use(payload, output, provider, model, timeout=900, prompt_text="")
             objects = parse_json_objects(raw)
             record.update(status="ambiguous", reason="timeout", timeout_seconds=timeout)
             die(f"Image outcome ambiguous; no automatic retry. Journal: {journal}", 3)
-        except OSError:
-            diagnostic_stage = 'process_start'
-            record.update(status="failed_pre_submit", reason="process_start_failed")
-            die(f"Unable to start model CLI. Journal: {journal}", 2)
+        except OSError as exc:
+            # FileNotFoundError means the CLI executable was absent.  Every other
+            # OSError can occur after native-offload accepted or wrote media.
+            if isinstance(exc, FileNotFoundError):
+                diagnostic_stage = 'process_start'
+                record.update(status="failed_pre_submit", reason="process_start_failed")
+                die(f"Unable to start model CLI. Journal: {journal}", 2)
+            diagnostic_stage = 'model_call'
+            record.update(status="ambiguous", reason="cli_os_error")
+            die(f"Image outcome ambiguous; no automatic retry. Journal: {journal}", 3)
         raw = _text(p.stdout)
         objects = parse_json_objects(raw)
         record["returncode"] = p.returncode
@@ -612,14 +742,21 @@ def run_model_use(payload, output, provider, model, timeout=900, prompt_text="")
                                lambda: inspect_stage(stage, record))
             # Never delete a submitted task directory on an uncertain outcome:
             # native offload may still be writing after the local CLI stops.
-            if record['status'] in {'succeeded', 'failed_pre_submit'}:
+            incomplete = (record.get('inspection_limit_reached', False)
+                          or record.get('unclassified_stage_content', False))
+            if (record['status'] in {'succeeded', 'failed_pre_submit'}
+                    and not incomplete
+                    and not (record['status'] == 'failed_pre_submit' and record['verified_media'])):
                 removed = cleanup_action(record, 'remove_stage', stage,
                                          lambda: shutil.rmtree(stage))
                 record['stage_retained'] = not removed
                 if removed and record['status'] == 'succeeded':
                     record['verified_media'] = list(record['images'])
+                if removed and record['status'] == 'failed_pre_submit':
+                    record['raw_response_preserved'] = False
             else:
                 record['stage_retained'] = True
+                record['raw_response_preserved'] = True
             record['actual_n'] = len(record['images'])
             record['cleanup_status'] = 'failed' if record['cleanup_errors'] else 'complete'
             save_journal(journal, record)
@@ -756,7 +893,10 @@ def edit(args):
 
 
 def list_models_cli():
-    p = subprocess.run(["minis-model-use", "list", "--modality", "image_output"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        p = subprocess.run(["minis-model-use", "list", "--modality", "image_output"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except BaseException:
+        die('Unable to list image models')
     print(p.stdout, end="")
     raise SystemExit(p.returncode)
 
@@ -794,4 +934,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        # Exception messages may include private prompts or provider echoes.
+        print(json.dumps({'status': 'error', 'error_type': type(exc).__name__,
+                          'message': 'Operation failed; inspect the task journal. No automatic retry.'}),
+              file=sys.stderr)
+        sys.exit(2)

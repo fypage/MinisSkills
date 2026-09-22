@@ -1,7 +1,7 @@
 ---
 name: image-generator
 description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.2.0
+version: 1.2.1
 compatibility: OpenMinis Android 0.18+；使用 minis-model-use image_output；凭据留在 App 供应商设置中。
 ---
 
@@ -151,7 +151,7 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 文件路径：`{path}`
 ```
 
-`清晰度` 与 `比例` 必须来自实际文件；精确约分比例与近似常见比例分别标注（近似值写“约”），不以容差标签充当严格画幅验收。未能读取时明确写请求值，不伪装成实际值。默认不展示完整提示词、请求 JSON、任务日志或额外“张数/1K”行，除非用户要求。
+`质量` 为请求参数，不代表已验证供应商实际生效；只有明确的返回证据才可补充实际质量。`清晰度` 与 `比例` 必须来自实际文件；精确约分比例与近似常见比例分别标注（近似值写“约”），不以容差标签充当严格画幅验收。未能读取时明确写请求值，不伪装成实际值。默认不展示完整提示词、请求 JSON、任务日志或额外“张数/1K”行，除非用户要求。
 
 ## 维护门禁
 
@@ -159,8 +159,10 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 
 ```sh
 cd /var/minis/skills/image-generator
-python3 -m unittest discover -s scripts -p 'test_*.py' -v
+BROWSER_RECOVER_LIVE_TEST=0 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 python3 -m py_compile scripts/openminis_image.py scripts/browser_recover.py
 ```
 
-测试不得实际发起付费生图；模型调用一律 mock。
+测试不得实际发起付费生图；模型调用一律 mock。浏览器真机探针须另行显式启用，不能混称为离线测试。
+
+评估规则与人工工具轨迹验收见 `evals/acceptance.md`。`evals/evals.json` 的字符串检查至多验证输出措辞，不能证明发生了工具调用、没有重试、没有上传或已视觉核验；不得将字符串命中或版本升级称为修复通过。发布结论须分别记录离线测试、人工轨迹与远端验证的通过/失败/未验收状态。上述“应完成”是验收要求，不是未经测试的成功保证。
