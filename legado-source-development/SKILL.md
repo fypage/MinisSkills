@@ -23,6 +23,7 @@ version: 4.0.0
 | MD3 差异、解析器版本、导入契约 | `references/md3-compat.md` |
 | 验证分层、沙箱、交付门槛 | `references/testing.md` |
 | 本技能如何自检、案例存档、版本表 | `references/maintenance.md` |
+| **实战案例复盘（先读这个）** | `references/cases/` — 每案一节「为什么没测出来」 |
 
 ## 二、非协商约束（硬约束）
 

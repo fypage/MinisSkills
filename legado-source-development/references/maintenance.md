@@ -34,9 +34,19 @@ python3 scripts/test_debug_parser.py  # 调试脚本解析器 64 例
 | 书源成品 | `/var/minis/shared/legado/sources/` | 主文件 + 带版本后缀的历史版本 |
 | 分析报告 | `/var/minis/shared/legado/analysis/<站点>/` | 一份 REPORT.md 收口 |
 | 推送前备份 | `/var/minis/backups/minsiskills-legado-pre-push/` | 远端旧版留档，便于回滚 |
+| **案例复盘** | `references/cases/<日期>-<站点>-<主题>.md` | 随技能走；只写方法与教训，**不放书源成品** |
+
+**案例复盘的写法**：现象 → 初始误判 → 根因 → 正解 → **「为什么没测出来」** → 可复用清单。
+最后一节是重点：**一个案例的价值在于它暴露了验证方法的什么缺口**，而不是它修好了哪个站。
 
 **改前备份、改后复检**：脚本自报 OK 不算数，必须 `rg` 复检旧串归零
 （曾发生批替换全部打印 OK 却未落盘）。
+
+## 二之二、案例索引
+
+| 案例 | 一句话结论 |
+|---|---|
+| [`cases/2026-10-bookmaopu-content-container.md`](cases/2026-10-bookmaopu-content-container.md) | **同一 `#nr1` 容器在不同书是两种结构**（33 个 `<p>` vs 43 个 `<br>`），`p@text` 会取空；容器级 `@text` 才通吃。★更重要：调试脚本**样本单一**（只验 `<p>` 型）+ **`textNodes` 静默降级**（改的规则从未被执行、却报通过）两个盲区叠加，导致问题一路「绿灯」。 |
 
 ## 三、仓库同步
 
