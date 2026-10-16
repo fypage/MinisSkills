@@ -18,6 +18,17 @@ RSS 使用 `sourceUrl/sourceName`，不是 `bookSourceUrl/bookSourceName`。不�
 
 教程把“列表下一页规则”也写成 `ruleArticles`，这是笔误。MD3 基线 `RssSource.kt` 确认真实字段为 `ruleNextPage`；其他客户端版本仍应按对应源码核对。
 
+### ★RSS 字段表（2026-10-16 对照 MD3 上游 `RssSource.kt` 实测）
+
+- 规则类：`ruleArticles` `ruleNextPage` `ruleTitle` `rulePubDate` `ruleDescription` `ruleImage` `ruleLink` `ruleContent`
+- 标识类：`sourceUrl` `sourceName` `sourceIcon` `sourceGroup` `sourceComment` `enabled` `sortUrl` `singleUrl` `articleStyle` `customOrder` `lastUpdateTime`
+- 抓取类：`header` `jsLib` `enabledCookieJar` `concurrentRate` `loginUrl` `loginUi` `loginCheckJs` `coverDecodeJs` `variableComment`
+- 网页壳类（教程未收录）：`contentWhitelist` `contentBlacklist` `shouldOverrideUrlLoading` `style` `enableJs` `loadWithBaseUrl` `injectJs` `preloadJs` `startHtml` `startStyle` `startJs` `showWebLog`
+
+> 教程里出现的 `loadWithBaseUrl: true`、`enableJs: true` 确实存在；
+> 但**「列表下一页规则」教程误写成 `ruleArticles`**，真名 `ruleNextPage`——
+> 写成 `ruleArticles` 的结果是**同一字段被覆盖，分页彻底失效**（比静默更糟：直接改写了列表规则本身）。
+
 ## 分页
 
 教程说明 RSS 上拉分页不提供书源式 `{{page}}`，需要规则/JS 自行推进。验证至少覆盖首次加载、一次上拉、末端停止与文章去重。

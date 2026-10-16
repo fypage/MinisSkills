@@ -3,16 +3,30 @@
 import argparse,json,re,sys
 from pathlib import Path
 
+# 字段表依据：目标 APK `io.legato.kazusa` dex 内 Room Schema 串 + MD3 上游 *Rule.kt
+# 复核日期 2026-10-16。详见 references/md3-compat.md
 BOOK_REQUIRED=("bookSourceUrl","bookSourceName")
 RSS_REQUIRED=("sourceUrl","sourceName")
 BOOK_RULES={
 "ruleSearch":{"checkKeyWord","bookList","name","author","intro","kind","lastChapter","updateTime","bookUrl","coverUrl","wordCount"},
 "ruleExplore":{"bookList","name","author","intro","kind","lastChapter","updateTime","bookUrl","coverUrl","wordCount"},
-"ruleBookInfo":{"init","bookInfoInit","name","author","intro","kind","lastChapter","updateTime","coverUrl","tocUrl","wordCount","canReName","downloadUrls","relatedBooks"},
+# 注意：真名是 init，不是 bookInfoInit。见 KNOWN_BAD_FIELDS。
+"ruleBookInfo":{"init","name","author","intro","kind","lastChapter","updateTime","coverUrl","tocUrl","wordCount","canReName","downloadUrls","relatedBooks"},
 "ruleToc":{"preUpdateJs","chapterList","chapterName","chapterUrl","formatJs","isVolume","isVip","isPay","updateTime","nextTocUrl"},
 "ruleContent":{"content","subContent","title","nextContentUrl","webJs","sourceRegex","replaceRegex","imageStyle","imageDecode","payAction","callBackJs"},
 "ruleReview":{"reviewUrl","avatarRule","contentRule","postTimeRule","reviewQuoteUrl","voteUpUrl","voteDownUrl","postReviewUrl","postQuoteUrl","deleteUrl"}}
 RSS_RULE_FIELDS={"ruleArticles","ruleNextPage","ruleTitle","rulePubDate","ruleDescription","ruleImage","ruleLink","ruleContent"}
+
+# 高置信度错名 → 正确名。命中即报 error（不是 warning）：写错会静默失效。
+KNOWN_BAD_FIELDS={
+"ruleBookInfo.bookInfoInit":"ruleBookInfo.init（详情预处理；写 bookInfoInit 会静默失效，空值无副作用故极易被漏过）",
+"ruleBookInfo.ruleBookInfoInit":"ruleBookInfo.init",
+}
+# 教程笔误：把“列表下一页规则”写成 ruleArticles。真名 ruleNextPage。
+# 更糟的是同名覆盖——直接改写列表规则本身，分页彻底失效且无报错。
+RSS_BAD_FIELDS={
+"ruleArticles_as_nextpage":"ruleNextPage（“列表下一页规则”真名；用 ruleArticles 会覆盖列表规则）",
+}
 
 def add(out,level,where,msg): out.append({"level":level,"where":where,"message":msg})
 def load(path):
@@ -102,8 +116,12 @@ def check_book(x,label,out,target):
    check_rule_text(v,where,out,target)
    if rn in ("ruleSearch","ruleExplore") and f=="bookList" and isinstance(v,str) and "###" in v: add(out,"error",where,"列表字段不应使用 OnlyOne")
    if rn=="ruleToc" and f=="chapterList" and isinstance(v,str) and "###" in v: add(out,"error",where,"目录列表不应使用 OnlyOne")
- if target=="md3" and isinstance(x.get("ruleBookInfo"),dict) and "bookInfoInit" in x["ruleBookInfo"] and "init" not in x["ruleBookInfo"]:
-  add(out,"warning",label+".ruleBookInfo.bookInfoInit","MD3 基线字段为 init")
+ if target=="md3" and isinstance(x.get("ruleBookInfo"),dict):
+  bi=x["ruleBookInfo"]
+  full=label+".ruleBookInfo."
+  for bad,why in KNOWN_BAD_FIELDS.items():
+   f=bad.split(".",1)[1]
+   if f in bi: add(out,"error",full+f,"错名，MD3 基线为 "+why)
  for f in ("searchUrl","exploreUrl","loginUrl"):
   if f in x: check_rule_text(x[f],label+"."+f,out,target)
  s=x.get("searchUrl")
@@ -117,6 +135,9 @@ def check_rss(x,label,out,target):
  if x.get("ruleArticles"):
   for f in ("ruleTitle","ruleLink"):
    if not isinstance(x.get(f),str) or not x[f].strip(): add(out,"error",label,f"自定义列表必须填写 {f}")
+ # 教程把“列表下一页”写成 ruleArticles；若真的照抄，分页规则会覆盖列表规则本身
+ if isinstance(x.get("ruleArticles"),str) and x["ruleArticles"].strip() and "{{page}}" in x["ruleArticles"]:
+  add(out,"error",label+".ruleArticles","RSS 不支持 {{page}}；分页请用 ruleNextPage（教程笔误易致同名覆盖）")
 
 def validate(path,target,forced):
  r={"file":str(path),"sources":0,"errors":0,"warnings":0,"issues":[]}

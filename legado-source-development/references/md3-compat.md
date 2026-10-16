@@ -2,9 +2,34 @@
 
 目标仓库：`HapeLee/legado-with-MD3`
 
-- 已核对提交：`6dc297221a22e532354810fb2804592dd08e5a9d`
-- 提交时间：2026-08-26T17:14:51Z
+- 已核对提交：`6dc297221a22e532354810fb2804592dd08e5a9d`（2026-08-26T17:14:51Z）
+- 复核日期：2026-10-16（对照用户 APK + 上游 `main` 源码，见下「双源对账」）
 - 目标 APK 更新后，应重新核对源码，不把本文件当永久事实。
+
+## 双源对账（2026-10-16）
+
+两条证据链互相独立，逐字段比对**无冲突**：
+
+| 证据 | 来源 | 用途 |
+|---|---|---|
+| A. 目标 APK | 用户上传 `shared-ca814def.apk`，包名 `io.legato.kazusa`，revision `070ca1a9b2e4…` | 桩：dex 内 Room Schema 串 |
+| B. 上游源码 | `HapeLee/legado-with-MD3@main`，`app/src/main/java/io/legado/app/data/entities/` | 桩：Kotlin data class |
+
+- APK 时间上略早于 B 的当前 HEAD（上游 2026-10-14 仍有提交），但字段集合一致。
+- **字段以 A 为准**（目标程序证据 > 源码）；B 用于读懂语义与备注。
+- `BookSource.kt` 顶层 39 字段 + `BookInfoRule`/`TocRule`/`SearchRule`/`ExploreRule`/`ContentRule`/`ReviewRule` 已逐条核对。
+
+### 字段表（实测，可直接抄）
+
+- `ruleBookInfo`：`init` `name` `author` `intro` `kind` `lastChapter` `updateTime` `coverUrl` `tocUrl` `wordCount` `canReName` `downloadUrls` `relatedBooks`
+- `ruleToc`：`preUpdateJs` `chapterList` `chapterName` `chapterUrl` `formatJs` `isVolume` `isVip` `isPay` `updateTime` `nextTocUrl`
+- `ruleSearch`：`checkKeyWord` + 列表字段（`bookList` `name` `author` `intro` `kind` `lastChapter` `updateTime` `bookUrl` `coverUrl` `wordCount`）
+- `ruleExplore`：同 `ruleSearch` 但**无** `checkKeyWord`
+- `ruleContent`：`content` `subContent` `title` `nextContentUrl` `webJs` `sourceRegex` `replaceRegex` `imageStyle` `imageDecode` `payAction` `callBackJs`
+- 顶层扩展（旧教程多未收录）：`jsLib` `enabledCookieJar` `concurrentRate` `coverDecodeJs` `variableComment` `respondTime` `exploreScreen` `ruleReview` `eventListener` `customButton` `homepageModules`
+
+> ⚠️ `ruleBookInfo` 含 `updateTime`，但部分旧版本文档未列；以本表为准。
+> ⚠️ `ruleExplore` **没有** `checkKeyWord`——写了也会被反序列化忽略。
 
 ## 证据范围
 
@@ -19,7 +44,44 @@
 - `ruleContent`：`subContent`、`title`、`replaceRegex`、`imageStyle`、`imageDecode`、`payAction`、`callBackJs` 等
 - `ruleReview`：段评字段；字段存在不代表全部 UI/业务已完成
 
-通用旧教程的详情预处理名是 `bookInfoInit`，此 MD3 基线模型使用 `init`。
+### ★详情预处理字段真名 = `init`（2026-10-16 已定案，非「待复核」）
+
+**结论**：`ruleBookInfo.init`，**不是** `bookInfoInit`。写 `bookInfoInit` 会**静默失效**。
+
+**三重证据（互相独立，全部指向 `init`）**：
+
+1. **目标 APK 实测**（最强）：用户上传的 `io.legato.kazusa` APK（revision `070ca1a9…`）
+   的 `classes*.dex` 中，Room 生成的 Schema 串列出 `ruleBookInfo.init` 存在，
+   而 `bookInfoInit` 出现次数为 **0**。
+2. **MD3 上游源码**：`app/src/main/java/io/legado/app/data/entities/rule/BookInfoRule.kt`
+   → `var init: String? = null`。
+3. **喵公子文档第 6 节**把该字段标题写作「预处理规则(bookInfoInit)」，**标题错、正文对**：
+   正文明确要求"js 的返回值需要是 json 对象，返回 `{a:…, b:…}`，书名规则填 `a`"——
+   这正是 `init` 的行为语义。
+
+> 若目标客户端为**旧版上游 Legado**（非 MD3 分支），同理以该版本的 `BookInfoRule.kt` 为准；
+> 本文件只担保 MD3 分支与上述 APK。
+
+**踩坑记录（值得引以为戒）**：`/var/minis/shared/legado/sources/` 的 `搬山人.json` 与
+`蓝海搜书.json` 都带一个 **空的** `"bookInfoInit": ""` 键。空值不触发预处理，所以这两条源
+**看起来"能用"**，于是错误字段名被"实测通过"掩盖了很久。教训：**空键不能作为字段名正确的证据**；
+命名有疑问时，去 dex / 源码里搜字面量，不要靠"它能跑"反推。
+
+**判别信号**：字段名写错的表现是「预处理完全不生效，且没有任何报错」。
+
+**快速取字段表的办法（本机 aarch64 跑不了 aapt——它是 x86-64 ELF）**：
+
+```sh
+python3 - <<'EOF'
+import zipfile
+z = zipfile.ZipFile('目标.apk')
+data = b''.join(z.read(n) for n in z.namelist() if n.endswith('.dex'))
+i = data.find(b'ruleBookInfo.author')      # Room Schema 报错串的锚点
+print(data[i-200:i+2200].decode('utf-8', 'replace'))
+EOF
+```
+
+一次性吐出全部 `ruleXxx.字段` 真名，可与本文件字段表逐条对账。
 
 ## URL 选项
 
