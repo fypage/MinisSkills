@@ -45,7 +45,7 @@ def site_of(src):
     return u.rstrip('/')
 
 # 这些是「取值后缀」，不能当 CSS 选择器的一部分
-VALUE_TAILS = ('href', 'src', 'value', 'text', 'html')
+VALUE_TAILS = ('href', 'src', 'value', 'text', 'textNodes', 'ownText', 'html')
 
 # 站点根由 bookSourceUrl 推出 —— ★ 不要写死站点，本脚本要能对任何书源使用
 SITE = ''
@@ -178,6 +178,29 @@ def css(html, sel, attr=None):
         return []
     if ops:
         els = apply_eq_pseudo(els, ops)
+    if attr == 'textNodes':
+        # ★ 真机语义：取元素下的**所有文本节点**并保留换行。
+        #   这是搜书类站点正文分段的**标准写法**（悠空网/书迷楼/小说巴士/无限小说网
+        #   均用 `p@textNodes`）。它与 `@text` 的差别在**是否插入段落换行**：
+        #   `@text` 把多个 `<p>` 拼成一坨（真机表现为「整段挤在一起、没有分段」），
+        #   `@textNodes` 保留各段边界 → 正常分段。
+        #   本脚本旧版把 `textNodes` 静默降级为 `text`（白名单外一律转 text），
+        #   因而**无法复现「一坨 vs 分段」这一差异**，会放过这类规则缺陷。
+        out = []
+        for e in els:
+            seg = ''.join(e.strings) if hasattr(e, 'strings') else e.get_text()
+            for ln in re.split(r'\r?\n', seg):
+                if ln.strip():
+                    out.append(ln.strip())
+        return out
+    if attr == 'ownText':
+        # 只取直接文本子节点，忽略后代元素文本
+        out = []
+        for e in els:
+            seg = ''.join(t for t in e.find_all(string=True, recursive=False))
+            if seg.strip():
+                out.append(seg.strip())
+        return out
     if attr:
         return [e.get(attr) for e in els]
     return [e.get_text(strip=True) for e in els]
@@ -444,10 +467,18 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
         #   节点上取不到就是空，这是正确语义（真机亦然）。
         return node_value(node, rule)
     sel, attr, regex = strip_suffixes(rule)
-    vals = css(html, sel, None if attr == 'text' else attr)
-    v = vals[0] if vals else ''
-    if isinstance(v, list):
-        v = v[0] if v else ''
+    vals = css(html, sel, attr if attr in ('textNodes', 'ownText') else (None if attr == 'text' else attr))
+    # ★ 真机语义：`sel@text` 命中多个元素时，Legado 会把它们的文本**全部拼接**
+    #   （正文 `#nr1 p@text` 逐段取值即依赖此行为，38 段全都要）。
+    #   旧版一律 `vals[0]` → 只返回第一段（实测 38 段只给出 15 字），
+    #   **会把正确的逐段规则误判成「取值过短」**。
+    #   `@textNodes` / `@ownText` 同样是多值语义，一并拼接。
+    if attr in ('text', 'textNodes', 'ownText'):
+        v = '\n'.join(x for x in vals if isinstance(x, str) and x.strip())
+    else:
+        v = vals[0] if vals else ''
+        if isinstance(v, list):
+            v = v[0] if v else ''
     return apply_regex(v if v is not None else '', regex)
 
 
