@@ -363,6 +363,51 @@ python3 scripts/copy_source.py source.json      # 生成 + 探针 + 写剪贴板
    改用 **`#readPanel p@text`** 逐段取，才拿到 95 段 / 2344 字干净正文。
    **凡见到 `is-initially-hidden` 这类「模板占位块」，一律找 id 绕开，不要靠「取第一个」。**
 
+## ★★ `{{...}}` 是 JavaScript 求值，不是变量插值（2026-10-16 夜，源码级实证）
+
+**真机报错**：`ReferenceError: "bookId" 未定义`（用户截图，书海阁目录页）。
+
+**根因**（MD3 源码 `AnalyzeUrl.kt` 第 204-207 行，实测读出）：
+
+```kotlin
+if (ruleUrl.contains("{{") && ruleUrl.contains("}}")) {
+    //替换所有内嵌{{js}}
+    val url = analyze.innerRule("{{", "}}") { evalJS(it) ?: "" }   // ← 当 JS 执行！
+```
+
+`AnalyzeRule.kt` 第 670-673 行进一步坐实：
+
+```kotlin
+tmp.startsWith("{{") -> {
+    ruleType.add(jsRuleType)                        // 标记为 JS
+    ruleParam.add(tmp.substring(2, tmp.length - 2)) // 剥掉花括号，内容当 JS 源码
+}
+```
+
+**所以 `{{...}}` 里只允许「内置变量名」**，其余一律被当 JS 表达式求值 → 变量不存在即抛 `ReferenceError`。
+
+**合法的内置名**（由引擎注入）：`key`、`page`、`baseUrl`、`book`、`result`、`java`、`cookie`、`cache`、`source`、`chapter`、`title`、`src`、`nextChapterUrl`…
+
+**两个实测踩中的错误写法**：
+
+| 错误写法 | 真机行为 | 正解 |
+|---|---|---|
+| `tocUrl: /book/indexList-{{bookId}}.html` | `evalJS("bookId")` → `ReferenceError: bookId 未定义` | `{{baseUrl}}##.*?/book/(\d+)\.html.*##/book/indexList-$1.html` |
+| `bookUrl: /book/{{$.id}}.html` | `evalJS("$.id")` → `$` 未定义（且以 `/` 开头会被判成 XPath） | `@js:result.id ? "/book/"+result.id+".html" : ""` |
+
+**「条目字段插值」的正解不是 `{{$.x}}`**：
+- JSONPath **原生支持** `$.x`（`AnalyzeRule.kt:632` `ruleStr.startsWith("$.") ->` 分支），但**不能塞进 `{{}}`**；
+- URL 需要前缀拼接时，用 **`@js:`** 引用 `result`（条目对象）自己拼。
+
+### ★ 由此立的三条铁律
+
+1. **写 `{{}}` 前先问：里面这个词是内置变量吗？** 不是就一律改用 `@js:` 或原生 JSONPath。
+2. **调试脚本必须与真机同语义**。本脚本早期私自支持 `{{bookId}}`/`{{$.id}}` 并做了 replace，
+   **给真机必炸的写法放行**——「脚本绿」因此毫无意义，甚至有害。
+   现已改为：只认内置名 + 按 `##正则##替换##` 处理，**不再为错误写法兜底**。
+3. **`{{baseUrl}}` 在 `tocUrl` 场景是合法的**（本书详情页 URL），但**必须实测该 URL 能取到正确目录**，
+   不能只看字符串非空（见本文档前文「验证 tocUrl 时…」）。
+
 ## 发布报告模板
 
 ```text

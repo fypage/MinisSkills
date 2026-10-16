@@ -1056,14 +1056,22 @@ def tab_toc(src, book, url):
     # ★ {{baseUrl}} 在 tocUrl 里指「本书详情页地址」；须先展开，否则会被
     #   当成 CSS 选择器送进解析器 → SelectorSyntaxError（看着像规则写错）。
     tpl = bi.get('tocUrl', '') or ''
+    # ★ 真机 Legado 在 tocUrl 里**只有 {{baseUrl}} 等变量，没有 {{bookId}}**
+    #   （{{bookId}} 是早期本脚本私加的，会让真机报 `ReferenceError: bookId 未定义`，
+    #    已在书海阁上实测踩到）。
+    #   本脚本一律按**真机语义**处理：展开变量后，再应用 `##正则##替换##`，
+    #   绝不能对真机不认的占位符放行。
     if '{{' in tpl:
-        # ★ 三个占位符都要展开：{{id}} / {{bookId}} 同为书籍 ID（实测漏其一会拼出
-        #   'indexList-{{bookId}}.html' 这种字面量地址 → HTTP 000、章节 0 条，
-        #   看着像目录规则写错）。
-        b_id = b_id or ''
-        turl = expand_host_vars(tpl, bu, None).replace('{{id}}', b_id).replace('{{bookId}}', b_id)
+        turl = expand_host_vars(tpl, bu, None)
     else:
         turl = eval_field(tpl, bh, bu, subr)
+    # `##正则##替换##`（tocUrl 常见写法：从详情页 URL 提取书籍 ID）
+    if turl.count('##') >= 2:
+        _head, _rest = turl.split('##', 1)
+        turl = apply_regex(_head, _rest)
+    # 兼容老写法：{{id}} 展开（部分书源确实这么用）
+    if b_id:
+        turl = turl.replace('{{id}}', b_id)
     if not turl:
         print('  \u2717 tocUrl 未生成地址 —— 请给书源补 ruleBookInfo.tocUrl（可用 {{baseUrl}}）')
         return
