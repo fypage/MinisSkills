@@ -61,6 +61,7 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 | 日期 | 变更 | 验证 |
 |---|---|---|
 | 2026-10-16 | 调试面板进技能：`debug_source.py`（站点无关五页签）、`exec_js_rule_node.py`（binds + `result`/`src` 注入）、`test_debug_parser.py`（64 项）；`testing.md` 增「十个坑」与「反爬镜像站」 | 64/64 + 30 PASS + 25 PASS + 校验 PASS |
+| 2026-10-16（下午） | **猫扑中文站实测暴露 9 处并修复**：① 脚本读 `bookSource.header`（`set_header`，UA 优先）② `{{baseUrl}}` 展开（`expand_host_vars`）③ toc 页签去站点硬编码（改用 `--url`/`bookUrlPattern`）④ `eval_container` 返回**元素对象**而非字符串（新增 `css_nodes`）⑤ 去掉节点取值的整页回退（194s → 6.6s，消除 OOM）⑥ 目录容器统一走 `eval_container`（`:has()` 可用）⑦ `bookUrl`/`coverUrl` 绝对化基准改站点根 ⑧ 探索页补充绝对化 ⑨ 修正提示文案。书源成品 `sources/猫扑中文.json`（五页签全通） | 64/64 + 25 PASS + 14+28 PASS + 静态 PASS（0 错 0 警） |
 
 ## 五、已知限制
 

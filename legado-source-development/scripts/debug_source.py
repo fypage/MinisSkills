@@ -50,12 +50,38 @@ VALUE_TAILS = ('href', 'src', 'value', 'text', 'html')
 # 站点根由 bookSourceUrl 推出 —— ★ 不要写死站点，本脚本要能对任何书源使用
 SITE = ''
 
+# 书源 header 字段（JSON 字符串）解析后的 dict。
+# ★ 真机 Legado 会带 header 发请求；脚本若不带，会把「站点因 UA 拒绝」误判成规则写错。
+SRC_HEADER = {}
+
 
 def set_site(u):
     """从 bookSourceUrl 推出站点根，供各页签拼默认地址。"""
     global SITE
     SITE = (u or '').rstrip('/')
     return SITE
+
+
+def set_header(raw):
+    """解析书源的 header 字段（JSON 字符串）→ 全局 SRC_HEADER。"""
+    global SRC_HEADER
+    SRC_HEADER = {}
+    if not raw:
+        return SRC_HEADER
+    if isinstance(raw, dict):
+        SRC_HEADER = {str(k): str(v) for k, v in raw.items()}
+        return SRC_HEADER
+    try:
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            SRC_HEADER = {str(k): str(v) for k, v in d.items()}
+    except Exception:
+        # 兼容 `k=v\nk2=v2` 形式
+        for line in str(raw).splitlines():
+            if '=' in line:
+                k, _, v = line.partition('=')
+                SRC_HEADER[k.strip()] = v.strip()
+    return SRC_HEADER
 
 
 def split_url_options(url):
@@ -95,14 +121,20 @@ def absolutize(u, base=None):
 def get(url, ref=None):
     url, opts = split_url_options(url)
     url = absolutize(url, opts.get('_base') or SITE)
-    cmd = ['curl', '-s', '-L', '--max-time', '30', '-A', UA,
+    cmd = ['curl', '-s', '-L', '--max-time', '30',
            '-w', '\n__CODE__%{http_code}']
-    if ref:
-        cmd += ['-e', ref]
+    # ★ 书源 header 里若指定了 User-Agent，就用它；否则退回默认 UA。
+    #   真机 Legado 会带 header，脚本不带会得出「规则错」的假结论。
+    merged = dict(SRC_HEADER)
     hdr = opts.get('headers')
     if isinstance(hdr, dict):
-        for k, v in hdr.items():
-            cmd += ['-H', '%s: %s' % (k, v)]
+        merged.update(hdr)
+    if not any(k.lower() == 'user-agent' for k in merged):
+        cmd += ['-A', UA]
+    for k, v in merged.items():
+        cmd += ['-H', '%s: %s' % (k, v)]
+    if ref:
+        cmd += ['-e', ref]
     method = str(opts.get('method', 'GET')).upper()
     body = opts.get('body', '')
     if method == 'POST':
@@ -406,12 +438,11 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
                           base, subrules or {}, dict(binds or {}, result=cur, src=cur))
         return out if out is not None else ''
     if node is not None and (is_bare_suffix(rule) or parse_tag_short(rule) or '<' not in rule):
-        # 只要不是整页级表达式，都先按相对取值试；取不到再退回整页
-        v = node_value(node, rule)
-        if v != '':
-            return v
-        if is_bare_suffix(rule) or parse_tag_short(rule):
-            return ''
+        # 条目内相对取值：**只在该节点上求值**。
+        # ★ 不可因取到空就退回整页 css() —— 那会对整页重解析一次，
+        #   目录 1596 章 × 2 字段 = 3000+ 次全页解析，实测 194 秒并被 OOM 杀掉。
+        #   节点上取不到就是空，这是正确语义（真机亦然）。
+        return node_value(node, rule)
     sel, attr, regex = strip_suffixes(rule)
     vals = css(html, sel, None if attr == 'text' else attr)
     v = vals[0] if vals else ''
@@ -427,7 +458,27 @@ def eval_container(rule, html, base, subrules=None):
         out, _log = M.run(rule, base, subrules or {})
         return str(out or '').split('\n')
     sel, attr, regex = strip_suffixes(rule)
-    return css(html, sel, None if attr == 'text' else attr)
+    # ★ 容器规则必须返回**元素对象**，供后续按章取值（chapterName/chapterUrl）。
+    #   旧版直接返回 css() 的字符串列表 → 目录循环拿到的是 str，
+    #   再取 @text / @href 自然全空（且不报错）。实测踩过。
+    return css_nodes(html, sel)
+
+
+def css_nodes(html, sel):
+    """按 CSS 选出**元素对象**列表（供容器规则逐条取值）。"""
+    from bs4 import BeautifulSoup
+    if not (sel or '').strip():
+        print('  ⚠ 解析异常：选择器为空（规则可能只写了取值后缀如 @href）')
+        return []
+    pure, ops = split_eq_pseudo(sel) if has_eq_pseudo(sel) else (sel, [])
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        els = soup.select(pure) if pure.strip() else []
+    except Exception as e:
+        print('  ⚠ 解析异常：CSS 解析失败（%s）｜选择器 %r'
+              % (e.__class__.__name__, sel))
+        return []
+    return apply_eq_pseudo(els, ops) if ops else els
 
 
 def title(t):
@@ -525,6 +576,9 @@ def tab_search(src, key, url):
     full = u if str(bare).startswith('http') else SITE + '/' + str(u).lstrip('/')
     html, code = get(full)
     _bu, _bo = split_url_options(full)
+    # ★ 绝对化基准要用「纯 URL」，不能带 ,{...} 选项 —— 否则 bookUrl 会被
+    #   拼成 'https://site/search.html, {"method":"POST"...' 这种垃圾。
+    _base = _bu if str(_bu).startswith('http') else SITE
     _m = str(_bo.get('method', 'GET')).upper()
     print('  请求 %s %s' % (_m, _bu))
     if _m == 'POST' and _bo.get('body'):
@@ -583,6 +637,10 @@ def tab_search(src, key, url):
         if not raw:
             continue
         v = eval_field(raw, html, full, node=node)
+        if f in ('bookUrl', 'coverUrl') and v and not str(v).startswith(('http', 'data:')):
+            # ★ 相对路径要以**站点根**为基准绝对化；用页面 URL 会拼出
+            #   '/page/search.html/34.html' 这类垃圾（实测踩过）。
+            v = absolutize(str(v), SITE)
         print('    %-9s %r' % (f, str(v)[:60]))
     if not (rs.get('name') or rs.get('bookUrl')):
         print('    （该源未单列字段规则，条目名与链接由 bookList 容器一次取出）')
@@ -626,12 +684,25 @@ def expand_page_tpl(u, page):
       站点多半 200 返回首页或 301 —— 看着像「翻页失效」，其实是模板没展开。
     """
     u = u or ''
+    u = expand_host_vars(u)
     m = re.search(r'<,([^>]*)>', u)
     if m:
         seg = m.group(1).replace('{{page}}', str(page))
         rep = '' if str(page) in ('1', '', '0') else seg
         u = u[:m.start()] + rep + u[m.end():]
     return u.replace('{{page}}', str(page))
+
+def expand_host_vars(u, base=''):
+    """展开 Legado 宿主变量：{{baseUrl}} / {{bookUrl}} / {{key}} 等。
+
+    ★ 真机 Legado 在 tocUrl / 正文等规则里会注入这些变量；脚本若不展开，
+      会把 '{{baseUrl}}' 当字面 URL 送出去 → 看着像「规则写错」。
+    """
+    if not u:
+        return u
+    u = u.replace('{{baseUrl}}', (base or SITE or '').rstrip('/'))
+    u = u.replace('{{bookUrl}}', base or '')
+    return u
 
 
 def lines_ok(raw):
@@ -713,7 +784,11 @@ def tab_explore(src, cat, page, url):
         r = re_.get(f, '')
         if r:
             # ★ 逐条目取值：像 bookUrl='@href' 这种相对写法只有拿到条目节点才对。
-            print('    %-11s %r' % (f, str(eval_field(r, html, full, node=node2))[:60]))
+            v = eval_field(r, html, full, node=node2)
+            if f in ('bookUrl', 'coverUrl') and v and not str(v).startswith(('http', 'data:')):
+                # 相对路径以站点根为基准（真机 Legado 亦如此）
+                v = absolutize(str(v), SITE)
+            print('    %-11s %r' % (f, str(v)[:60]))
 
 
 def tab_info(src, book, url):
@@ -733,7 +808,14 @@ def tab_info(src, book, url):
         r = bi.get(f, '')
         if not r:
             continue
-        v = eval_field(r, html, bu, subr)
+        # ★ tocUrl 常写 {{baseUrl}}（指本书详情页）；须先展开宿主变量，
+        #   否则会被当 CSS 选择器送进解析器 → SelectorSyntaxError。
+        if f == 'tocUrl' and '{{' in r:
+            v = expand_host_vars(r, bu).replace('{{id}}', str(book or ''))
+        else:
+            v = eval_field(r, html, bu, subr)
+        if f == 'coverUrl' and v and not str(v).startswith(('http', 'data:')):
+            v = absolutize(str(v), SITE)
         print('    %-9s %r' % (f, str(v)[:70]))
 
 
@@ -745,15 +827,34 @@ def tab_toc(src, book, url):
     m = re.search(r'book-(\d+)', url or '')
     if m:
         b_id = m.group(1)
-    bu = url or (SITE + '/m/book-%s.html' % b_id if b_id else SITE)
+    # ★ 不写死站点路径：优先用 --url；否则用书源的目录地址规则自己算。
+    #   旧版写死 /m/book-%s.html，只对 aabook 有效，换站必错。
+    bu = url or ''
+    bh = ''
+    if not bu:
+        pat = src.get('bookUrlPattern', '') or ''
+        if b_id and pat:
+            bu = pat.replace('{{id}}', b_id).replace('{{bookId}}', b_id)
+        if not bu:
+            # 无 --url、也无 bookUrlPattern：无法猜出本站书籍页形态。
+            # 直接把 tocUrl 指向站点根让规则自证（如 ruleBookInfo.tocUrl 用 {{baseUrl}}）。
+            bu = SITE
+            print('  \u26a0 未给 --url 且书源无 bookUrlPattern，'
+                  '以站点根请求（目录规则应基于书籍页，建议显式给 --url）')
     bh, _ = get(bu)
     subr = {}
     m2 = re.search(r'java\.getString\("([^"]+)"\)', bi.get('tocUrl', '') or '')
     if m2:
         subr[m2.group(1)] = eval_field(m2.group(1), bh, bu)
-    turl = eval_field(bi.get('tocUrl', ''), bh, bu, subr)
+    # ★ {{baseUrl}} 在 tocUrl 里指「本书详情页地址」；须先展开，否则会被
+    #   当成 CSS 选择器送进解析器 → SelectorSyntaxError（看着像规则写错）。
+    tpl = bi.get('tocUrl', '') or ''
+    if '{{' in tpl:
+        turl = expand_host_vars(tpl, bu).replace('{{id}}', b_id or '')
+    else:
+        turl = eval_field(tpl, bh, bu, subr)
     if not turl:
-        print('  \u2717 tocUrl 未生成地址，且无 --url 可回退 \u2014\u2014 请给 --book 或 --url')
+        print('  \u2717 tocUrl 未生成地址 —— 请给书源补 ruleBookInfo.tocUrl（可用 {{baseUrl}}）')
         return
     print('  目录地址: %s' % turl)
     # 排序由站点决定、规则无法左右；末行会按「第 N 章」实测判定升/降序，
@@ -762,20 +863,13 @@ def tab_toc(src, book, url):
     print('  响应 HTTP %s  len=%d' % (code, len(html)))
     cl = toc.get('chapterList', '')
     print('  chapterList: %s' % cl)
-    sel, _attr, _re = strip_suffixes(cl)
     # ★ 逐条目按「节点」取值，而不是整页批量取 name/href 再 zip：
     #   批量取在站点结构不对称时会错位，且无法支持 tag.a.0@href 这类相对写法。
+    #   统一走 eval_container（支持 :eq/:has 等），避免此处的选择器处理与主链路不一致。
     try:
-        _soup2 = BeautifulSoup(html, 'html.parser')
-        if has_eq_pseudo(sel):
-            _p2, _o2 = split_eq_pseudo(sel)
-            _els2 = _soup2.select(_p2) if _p2.strip() else []
-            if _o2:
-                _els2 = apply_eq_pseudo(_els2, _o2)
-        else:
-            _els2 = _soup2.select(sel) if (sel or '').strip() else []
+        _els2 = eval_container(cl, html, str(turl))
     except Exception as e:
-        print('  ⚠ 解析异常：目录容器选择器失败（%s）｜%r' % (e.__class__.__name__, sel))
+        print('  ⚠ 解析异常：目录容器选择器失败（%s）｜%r' % (e.__class__.__name__, cl))
         _els2 = []
     n_rule = toc.get('chapterName', '')
     u_rule = toc.get('chapterUrl', '')
@@ -790,7 +884,7 @@ def tab_toc(src, book, url):
         urls.append(str(_u or '').strip())
     print('  章节 %d 条' % len(names))
     if not names:
-        print('  ✗ 未取到章节。请核 chapterList 选择器是否命中本页：%r' % sel)
+        print('  ✗ 未取到章节。请核 chapterList 选择器是否命中本页：%r' % cl)
         return
     print('      首: %s' % names[0][:34])
     print('      末: %s' % names[-1][:34])
@@ -870,6 +964,7 @@ def main():
 
     src = json.load(open(a.source, encoding='utf-8'))
     set_site(src.get('bookSourceUrl', ''))
+    set_header(src.get('header', ''))
     print('书源：%s' % src.get('bookSourceName'))
     print('入口：%s' % src.get('bookSourceUrl'))
     print('限流：concurrentRate=%s' % src.get('concurrentRate'))
