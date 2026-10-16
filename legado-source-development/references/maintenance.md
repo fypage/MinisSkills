@@ -62,6 +62,8 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 |---|---|---|
 | 2026-10-16 | 调试面板进技能：`debug_source.py`（站点无关五页签）、`exec_js_rule_node.py`（binds + `result`/`src` 注入）、`test_debug_parser.py`（64 项）；`testing.md` 增「十个坑」与「反爬镜像站」 | 64/64 + 30 PASS + 25 PASS + 校验 PASS |
 | 2026-10-16（下午） | **猫扑中文站实测暴露 9 处并修复**：① 脚本读 `bookSource.header`（`set_header`，UA 优先）② `{{baseUrl}}` 展开（`expand_host_vars`）③ toc 页签去站点硬编码（改用 `--url`/`bookUrlPattern`）④ `eval_container` 返回**元素对象**而非字符串（新增 `css_nodes`）⑤ 去掉节点取值的整页回退（194s → 6.6s，消除 OOM）⑥ 目录容器统一走 `eval_container`（`:has()` 可用）⑦ `bookUrl`/`coverUrl` 绝对化基准改站点根 ⑧ 探索页补充绝对化 ⑨ 修正提示文案。书源成品 `sources/猫扑中文.json`（五页签全通） | 64/64 + 25 PASS + 14+28 PASS + 静态 PASS（0 错 0 警） |
+| 2026-10-16（晚） | **真机反馈驱动的第 20 条（书源侧规则缺口）**：列表卡无图而详情页有图 → `bookList` 只框了文字块 `li.tjxs`，封面所在的 `li.tjimg` 未进容器。修法：`bookList` 框整条 `ul.xbk`，字段选择器各落到对应 li。`testing.md` 增「第三批」+ 回归矩阵补注；`book-source.md` 增「★`bookList` 必须框住整条」节（含 HTML 样例与判据）。另记「源站 `src=""` 无图 ≠ 规则问题」的判读口径 | 搜索 21/30 有封面、发现 8/30 有封面（其余为源站空 `src`）；静态 PASS；解析器 64/64 |
+| 2026-10-16（晚·深查） | **第 21–24 条（书源侧）**：发现该站**正文有分页**——原 `nextContentUrl` 为空，长章只取到约 1/3（2805 字章实取 1258）。直接跟 `#pb_next` 又会把**整本书串成一篇**（末页该链接变「下一章」）。解法：`@js` 判「href 须带 `N.html` 尾缀」= 同章内页，**不依赖 `baseUrl`**（该阶段 `baseUrl` 语义不可靠）。另修：正文净化去掉 `^` 锚定（提示语**每页各一份**，原规则只清首次）；过滤源站孤立 `>` 残行。`testing.md` 增「第四批」 | node 真值表 6/6；链式取全文 5 页 5119 字、零残留；静态 PASS（0 错 0 警）；三套回归全绿（64 + 25 + 14/28） |
 
 ## 五、已知限制
 
@@ -71,3 +73,7 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 - 调试脚本只实现 **CSS 与 `@js`**；遇 JSONPath（`$.`）/ XPath（`//`）会明确报
   「未支持」，不硬解、不崩。
 - `@js:` + `java.ajax` 在真机的行为**未经真机验证**，仅有等价 node 执行证据。
+- **`exec_js_rule_node.py` 对相当一部分 `@js` 一律返回空串**（本机实测，
+  连 `@js:result='HELLO';` 都是空），**不能用来判定规则真假**。
+  JS 规则的正确验法：**把逻辑抽成纯函数，用本机 `node` 直接跑真值表**
+  （不依赖 `java.*` 宿主对象的那部分逻辑，这样测得准）。

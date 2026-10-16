@@ -12,6 +12,44 @@
 
 验证：尽量选择至少 2 项的样本检查名称和 URL 对齐，并补充单项及无结果场景；实际仅 0/1 项不应因此判失败。有分页时检查第 1/2 页不重复；无分页时可以没有 `{{page}}`，但须以响应行为确认。
 
+### ★`bookList` 必须框住整条，不能只框文字块
+
+搜书类站点的条目常写成**两个并列 `li`**：一个装封面、一个装文字：
+
+```html
+<ul class="xbk">
+  <li class="tjimg"><a href="/12377.html"><img src="/uploads/images/113918s.jpg" …></a>
+  <li class="tjxs">
+    <span class="xsm"><a href="/12377.html">食仙主</a></span>
+    <span class="">作者：<a href="javascript:;">鹦鹉咬舌</a></span>
+    <span class="">简介……</span>
+  </li>
+</ul>
+```
+
+若 `bookList` 只写 `ul.xbk li.tjxs`，封面所在的 `li.tjimg` **根本没进容器**，`coverUrl` 必然恒空；
+而 `name`/`bookUrl` 之类的**相对取值仍能命中**（所以书名、链接看着一切正常），
+**唯独封面缺失** —— 症状极具迷惑性，容易被误判成「站点没图」或「选择器写错」。
+
+**正确写法**：`bookList` 框**整条**（`ul` 或封面/文字两个 `li` 的公共祖先），
+各字段选择器各自落到对应子块：
+
+```json
+"bookList": "ul.xbk",
+"coverUrl": "li.tjimg img@src",
+"name":     "li.tjxs span.xsm a@text",
+"bookUrl":  "li.tjxs span.xsm a@href",
+"author":   "li.tjxs span:contains(作者) a@text",
+"intro":    "li.tjxs span:nth-of-type(3)@text##</?p>##"
+```
+
+**判据**：列表卡无图而**详情页有图** → 九成是 `bookList` 框小了，不是站的问题。
+
+**另一回事：源站自己就没图**。列表条目里出现 `<img src="">` 时，
+空 `src` 的图片**不会发起请求**，连站内 `onerror` 兜底的 `nocover.jpg` 也不会加载，
+界面上只剩文字块。**先抓原始 HTML 看 `src` 是否空串，再决定要不要改规则**；
+确有图片路径的（`/uploads/…jpg`）应能 200 取到，取不到的才是原图失效。
+
 发现地址常见：`名称::URL`，多项换行或 `&&`；也可能是样式 JSON。启用 `enabledExplore` 前必须实际验证至少一个分类。
 
 ## 详情
