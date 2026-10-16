@@ -334,6 +334,35 @@ python3 scripts/copy_source.py source.json      # 生成 + 探针 + 写剪贴板
 把 `>` 与空格两版都跑一遍对比（`soup.select()`），差 0 对 N 即是此因。
 **不要凭对搜索页的印象推发现页**——两页的层级深度常常不同。
 
+## ★调试脚本自身会「替站点背锅」的六种缺陷（2026-10-16 书海阁）
+
+书海阁是**纯 API 站**（搜索/目录走 JSON），用它逼出了 `debug_source.py` 六个通用缺陷。
+**共性：脚本缺陷的表现与「规则写错」完全一样（页签 0 条 / 字段全空），极易误判成书源问题。**
+
+| # | 缺陷 | 假象 | 修法 |
+|---|---|---|---|
+| 1 | 不支持 JSONPath，遇 `$.data.list` 直接拒答 | 搜索/目录页签 0 条 | 实现 `_jp_tokens()` + `jsonpath()`；`eval_container` 遇 JSONPath 返回 **dict 条目列表** |
+| 2 | 取值只在 HTML 上跑 | JSON 站点字段全空 | `css()` / `eval_field()` 支持 **dict 条目**（`$.字段` 与 `{{$.x}}` 模板插值） |
+| 3 | 列表页签 `node` 硬从 BeautifulSoup 取 | 条目字段 `''`（JSON 里没有 HTML 节点） | 容器返回 dict 时 **`node = items[0]`** |
+| 4 | 取书籍 ID 写死 `book-(\d+)`（aabook 专用） | tocUrl 展开成 `indexList-.html` → HTTP 404 | 改通用：先试书源 `bookUrlPattern`，再取 URL 中**最长数字串** |
+| 5 | `{{bookId}}` 未展开（只 replace 了 `{{id}}`） | 目录地址含字面量 `{{bookId}}` → HTTP 000 | 两个占位符都替换 |
+| 6 | `node_value` 不支持「裸后缀 + `##正则##`」 | `chapterName:@text##\[免费\]##` 整条被当选择器 → 章节 0 条 | 先 `partition('##')` 剥后缀，**取值后再 `apply_regex`** |
+
+**两条元规矩**：
+
+1. **脚本报 0 条时，第一步不是改书源，而是拿接口原始返回自证。**
+   本次搜索接口实测返回 12 条 → 立刻定位到脚本而非规则。
+   （同类教训已有一次：猫扑 `minDuration` 参数自造的假 bug。）
+2. **`@text` / `@href` 必须带 `@`**（文档 §规则语法 已立）。
+   本次 `chapterName:'text'`、`chapterUrl:'href'` 裸写，
+   脚本 `is_bare_suffix()` 判为 `False` → 落到 CSS → 在整页找 `<text>` 标签 → 0 条。
+   **脚本此处判错是「正确行为」，它在替我们抓错**——别去改判据迎合规则。
+3. **`.txtwrap` 类「同 class 多块」务必用 id 精确命中。**
+   书海阁章节页有两个 `.txtwrap`：`#readPanel`（真正文）/ `#vipPanel.is-initially-hidden`（占位提示）。
+   用 `.txtwrap@text` 会把两块**拼接**，38 字占位提示排在最前 → 误判成「付费墙」。
+   改用 **`#readPanel p@text`** 逐段取，才拿到 95 段 / 2344 字干净正文。
+   **凡见到 `is-initially-hidden` 这类「模板占位块」，一律找 id 绕开，不要靠「取第一个」。**
+
 ## 发布报告模板
 
 ```text

@@ -152,7 +152,109 @@ def get(url, ref=None):
     return body, code
 
 
+def _jp_tokens(path):
+    """把 `$.a.b[0].c` 切成 ['a','b',0,'c']；支持 $、.key、[n]、['key']。"""
+    import re as _re
+    p = path.strip()
+    p = _re.sub(r'^\$', '', p)
+    toks = []
+    i = 0
+    while i < len(p):
+        c = p[i]
+        if c == '.':
+            i += 1
+            m = _re.match(r'[A-Za-z_$][\w$\-]*', p[i:])
+            if m:
+                toks.append(m.group(0)); i += len(m.group(0))
+        elif c == '[':
+            j = p.find(']', i)
+            if j < 0: break
+            inner = p[i+1:j].strip()
+            if (inner.startswith("'") and inner.endswith("'")) or \
+               (inner.startswith('"') and inner.endswith('"')):
+                toks.append(inner[1:-1])
+            else:
+                try: toks.append(int(inner))
+                except ValueError: toks.append(inner)
+            i = j + 1
+        else:
+            i += 1
+    return toks
+
+
+def _jp_get(obj, toks):
+    """按 tokens 逐层取值；任一层缺失返回 None。数字键先按 list 下标，失败再按 str 键。"""
+    cur = obj
+    for t in toks:
+        if cur is None: return None
+        if isinstance(cur, dict):
+            cur = cur.get(t)
+        elif isinstance(cur, list):
+            if isinstance(t, int) and 0 <= t < len(cur):
+                cur = cur[t]
+            else:
+                return None
+        else:
+            return None
+    return cur
+
+
+def jsonpath(payload, sel, attr=None):
+    """JSONPath 取值（Legado `$.` 语法子集）。
+
+    支持：`$.a.b`、`$.a[0].b`、`$['a']['b']`、`$.a[*].b`
+    语义对齐 Legado：返回**列表**（命中多个即多条，命中单个也包成单元素列表）。
+    `attr` 为 `text` 时转字符串；payload 本身非 JSON 时**明确报错**，不静默成 0 条。
+    """
+    import json as _json
+    sel = (sel or '').strip()
+    if isinstance(payload, (dict, list)):
+        data = payload
+    else:
+        try:
+            data = _json.loads(payload)
+        except Exception:
+            print('  ⚠ JSONPath 作用于非 JSON 响应（%r 开头），请确认 searchUrl 返回 JSON'
+                  % (str(payload)[:40]))
+            return []
+    toks = _jp_tokens(sel)
+
+    # 支持 `[*]` 通配：逐段展开
+    values = [data]
+    for t in toks:
+        nxt = []
+        for v in values:
+            if t == '*':
+                if isinstance(v, list): nxt.extend(v)
+                elif isinstance(v, dict): nxt.extend(v.values())
+            else:
+                got = _jp_get(v, [t])
+                if got is not None:
+                    nxt.append(got)
+        values = nxt
+
+    out = []
+    for v in values:
+        if isinstance(v, (dict, list)):
+            out.append(_json.dumps(v, ensure_ascii=False))
+        else:
+            out.append('' if v is None else str(v))
+    if not out:
+        print('  ⚠ JSONPath %r 无命中（响应已解析为 JSON，非格式问题）' % sel)
+    return out
+
+
 def css(html, sel, attr=None):
+    """取值统一入口。html 可以是 HTML 字符串，也可以是**dict 条目**（API 站场景）。"""
+    # ★ dict 条目（来自 JSONPath 容器）：直接跑 JSONPath 取字段
+    if isinstance(html, (dict, list)):
+        k = rule_kind(sel)
+        if k == 'jsonpath' or (sel or '').strip().startswith('$.') or sel == '$':
+            return jsonpath(html, sel, attr)
+        # 非 JSONPath 的取值（如 @text/@href）在 dict 上无意义，明确报错
+        print('  ⚠ JSONPath 容器下，取值也必须是 JSONPath（当前 %r）' % sel)
+        return []
+
     """CSS 取值。★ 三类情况分别报清，绝不静默吞成「0 条」：
 
     - 选择器为空        → 打 `⚠ 解析异常`
@@ -164,8 +266,10 @@ def css(html, sel, attr=None):
         print('  ⚠ 解析异常：选择器为空（规则可能只写了取值后缀如 @href）')
         return []
     k = rule_kind(sel)
-    if k in ('jsonpath', 'xpath'):
-        print('  ⚠ 未支持：该规则是 %s 语法（%r），本脚本只实现 CSS 与 @js'
+    if k == 'jsonpath':
+        return jsonpath(html, sel, attr)
+    if k == 'xpath':
+        print('  ⚠ 未支持：该规则是 %s 语法（%r），本脚本只实现 CSS、JSONPath 与 @js'
               % ('JSONPath' if k == 'jsonpath' else 'XPath', sel[:40]))
         return []
     pure, ops = split_eq_pseudo(sel) if has_eq_pseudo(sel) else (sel, [])
@@ -377,20 +481,27 @@ def node_value(node, rule):
     """在指定节点上跑规则：只支持「纯后缀」与「@css:相对选择器@attr」。
 
     条目内相对取值是搜书类书源的高频写法，缺了它整页 bookUrl/coverUrl 全空。
+    ★ `@text##正则##替换##` 这类「裸后缀 + 后处理」要**先取值、再应用正则**
+      （旧版把整条当选择器 → soupsieve 抛 SelectorSyntaxError → 章节 0 条，
+       看着像站点改版）。
     """
     if node is None:
         return ''
     r = (rule or '').strip()
-    if is_bare_suffix(r):
-        attr = r[1:]
+    # 裸后缀 + 可选 `##正则##替换##` 后处理
+    head, sep, tail = r.partition('##')
+    if is_bare_suffix(head):
+        attr = head[1:]
         if attr == 'text':
-            return node.get_text(strip=True)
-        if attr == 'html':
-            return str(node)
-        v = node.get(attr)
-        if v is None:
-            return ''
-        return v if not isinstance(v, list) else (v[0] if v else '')
+            val = node.get_text(strip=True)
+        elif attr == 'html':
+            val = str(node)
+        else:
+            _v = node.get(attr)
+            val = '' if _v is None else (_v[0] if isinstance(_v, list) and _v else _v)
+        if sep and tail:
+            return apply_regex(val, tail)
+        return val
     ts = parse_tag_short(r)
     if ts:
         tname, idx, tattr = ts
@@ -431,8 +542,22 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
     """跑一条非 JS 规则，返回单值。空值统一返回（空）。
 
     node 非空时按「条目内相对取值」处理（见 node_value）。
+    ★ node 也可以是 **dict 条目**（JSONPath 容器场景），此时规则按其语义解释。
     """
     if not rule:
+        return ''
+    # ★ 条目是 dict（来自 `$.data.list` 这类 JSONPath 容器）：
+    #   - `$.字段`  → 在该条目上跑 JSONPath
+    #   - 含 `{{$.x}}` 的模板（如 /book/{{$.id}}.html）→ 从该条目插值
+    #   - 其余（@text/@href 之类 HTML 取值）在 JSON 上无意义，明确报错
+    if isinstance(node, (dict, list)):
+        r = rule.strip()
+        if r.startswith('$.') or r.startswith('$[') or r == '$':
+            vals = jsonpath(node, r)
+            return vals[0] if vals else ''
+        if '{{$.' in r:
+            return expand_host_vars(r, base, node)
+        print('  ⚠ JSONPath 容器下取值 %r：条目是 JSON，取字段请用 $.字段' % r[:30])
         return ''
     init_rule(rule, html, base)
     if rule.startswith('@js:'):
@@ -460,7 +585,8 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
         out, _log = M.run(code if code.strip().startswith(('return', 'var')) else code,
                           base, subrules or {}, dict(binds or {}, result=cur, src=cur))
         return out if out is not None else ''
-    if node is not None and (is_bare_suffix(rule) or parse_tag_short(rule) or '<' not in rule):
+    if node is not None and (is_bare_suffix(rule) or is_bare_suffix(rule.split('##')[0])
+                             or parse_tag_short(rule) or '<' not in rule):
         # 条目内相对取值：**只在该节点上求值**。
         # ★ 不可因取到空就退回整页 css() —— 那会对整页重解析一次，
         #   目录 1596 章 × 2 字段 = 3000+ 次全页解析，实测 194 秒并被 OOM 杀掉。
@@ -489,6 +615,29 @@ def eval_container(rule, html, base, subrules=None):
         out, _log = M.run(rule, base, subrules or {})
         return str(out or '').split('\n')
     sel, attr, regex = strip_suffixes(rule)
+    # ★ JSONPath 容器（API 站）：返回 **dict 条目列表**，供后续 $.字段 逐条取值
+    if rule_kind(sel) == 'jsonpath':
+        import json as _json
+        try:
+            data = _json.loads(html)
+        except Exception:
+            print('  ⚠ 解析异常：容器是 JSONPath（%r）但响应不是 JSON' % rule)
+            return []
+        toks = _jp_tokens(sel)
+        vals = [data]
+        for t in toks:
+            nxt = []
+            for v in vals:
+                if t == '*':
+                    if isinstance(v, list): nxt.extend(v)
+                    elif isinstance(v, dict): nxt.extend(v.values())
+                else:
+                    g = _jp_get(v, [t])
+                    if g is not None: nxt.append(g)
+            vals = nxt
+        if len(vals) == 1 and isinstance(vals[0], list):
+            return vals[0]
+        return vals
     # ★ 容器规则必须返回**元素对象**，供后续按章取值（chapterName/chapterUrl）。
     #   旧版直接返回 css() 的字符串列表 → 目录循环拿到的是 str，
     #   再取 @text / @href 自然全空（且不报错）。实测踩过。
@@ -638,10 +787,9 @@ def tab_search(src, key, url):
         return
 
     _k = rule_kind(list_rule)
-    if _k in ('jsonpath', 'xpath'):
-        print('  ⚠ 未支持：bookList 为 %s 语法（%r）\u2014\u2014 本脚本只实现 CSS 与 @js，'
-              '真机由 Legado 解析' % (_k, list_rule[:30]))
-        # 仍尝试把该页抓下来给人看，避免「什么都没输出」
+    if _k == 'xpath':
+        print('  ⚠ 未支持：bookList 为 xpath 语法（%r）—— 本脚本只实现 CSS 与 JSONPath，'
+              '真机由 Legado 解析' % (list_rule[:30],))
     items = eval_container(list_rule, html, full)
     # ★ 子规则要在「条目节点」上取值（bookUrl='@href' 是高频写法）；
     #   只传整页 html 会让这类字段全空，看着像规则写错。
@@ -649,17 +797,22 @@ def tab_search(src, key, url):
     if not (list_rule.startswith('@js:') or '<js>' in list_rule):
         # ★ 这里要的是**元素对象**（供 node.select/on.get），不是 css() 的文本结果。
         #   用 css() 拿到的字符串交给 node_value 会 AttributeError —— 实测踩过。
-        sel0, _a0, _r0 = strip_suffixes(list_rule)
-        pure0, ops0 = split_eq_pseudo(sel0) if has_eq_pseudo(sel0) else (sel0, [])
-        try:
-            _soup = BeautifulSoup(html, 'html.parser')
-            els0 = _soup.select(pure0) if pure0.strip() else []
-        except Exception as e:
-            print('  ⚠ 解析异常：容器选择器失败（%s）｜%r' % (e.__class__.__name__, sel0))
-            els0 = []
-        if ops0:
-            els0 = apply_eq_pseudo(els0, ops0)
-        node = els0[0] if els0 else None
+        # ★ 若容器是 JSONPath（返回 dict 条目），node 直接用**当前条目**，
+        #   不能再拿 BeautifulSoup 去 HTML 里选（JSON 站点选不出东西，字段全空）。
+        if items and isinstance(items[0], (dict, list)):
+            node = items[0]
+        else:
+            sel0, _a0, _r0 = strip_suffixes(list_rule)
+            pure0, ops0 = split_eq_pseudo(sel0) if has_eq_pseudo(sel0) else (sel0, [])
+            try:
+                _soup = BeautifulSoup(html, 'html.parser')
+                els0 = _soup.select(pure0) if pure0.strip() else []
+            except Exception as e:
+                print('  ⚠ 解析异常：容器选择器失败（%s）｜%r' % (e.__class__.__name__, sel0))
+                els0 = []
+            if ops0:
+                els0 = apply_eq_pseudo(els0, ops0)
+            node = els0[0] if els0 else None
     print('  结果 %d 条' % len(items))
     if items:
         print('    首: %s' % str(items[0])[:60])
@@ -679,7 +832,7 @@ def tab_search(src, key, url):
 
 # ---- 非 CSS 的其他规则语法：要能识别并给出「不支持」的明确提示，而不是崩 ----
 # 真机 Legado 支持 CSS / XPath / JSONPath($.) / @json / @js / @XPath:，
-# 本脚本只实现 CSS 与 @js。识别出来并明说，胜过拿 CSS 解析器去硬解、抛个 SelectorSyntaxError。
+# 本脚本实现 CSS、JSONPath 与 @js（xpath 未实现）。识别出来并明说，胜过拿 CSS 解析器去硬解、抛个 SelectorSyntaxError。
 
 def rule_kind(rule):
     r = (rule or '').strip()
@@ -715,7 +868,7 @@ def expand_page_tpl(u, page):
       站点多半 200 返回首页或 301 —— 看着像「翻页失效」，其实是模板没展开。
     """
     u = u or ''
-    u = expand_host_vars(u)
+    u = expand_host_vars(u, '', None)
     m = re.search(r'<,([^>]*)>', u)
     if m:
         seg = m.group(1).replace('{{page}}', str(page))
@@ -723,7 +876,7 @@ def expand_page_tpl(u, page):
         u = u[:m.start()] + rep + u[m.end():]
     return u.replace('{{page}}', str(page))
 
-def expand_host_vars(u, base=''):
+def expand_host_vars(u, base='', item=None):
     """展开 Legado 宿主变量：{{baseUrl}} / {{bookUrl}} / {{key}} 等。
 
     ★ 真机 Legado 在 tocUrl / 正文等规则里会注入这些变量；脚本若不展开，
@@ -733,6 +886,16 @@ def expand_host_vars(u, base=''):
         return u
     u = u.replace('{{baseUrl}}', (base or SITE or '').rstrip('/'))
     u = u.replace('{{bookUrl}}', base or '')
+    # ★ {{$.xxx}} —— 从「当前条目」的 JSON 取值插值（如 bookUrl: /book/{{$.id}}.html）
+    if '{{$.' in u and item is not None:
+        import re as _re
+
+        def _rep(m):
+            toks = _jp_tokens('$.' + m.group(1))
+            v = _jp_get(item, toks)
+            return '' if v is None else str(v)
+
+        u = _re.sub(r'\{\{\$\.([\w.$\[\]]+)\}\}', _rep, u)
     return u
 
 
@@ -842,7 +1005,7 @@ def tab_info(src, book, url):
         # ★ tocUrl 常写 {{baseUrl}}（指本书详情页）；须先展开宿主变量，
         #   否则会被当 CSS 选择器送进解析器 → SelectorSyntaxError。
         if f == 'tocUrl' and '{{' in r:
-            v = expand_host_vars(r, bu).replace('{{id}}', str(book or ''))
+            v = expand_host_vars(r, bu, r).replace('{{id}}', str(book or ''))
         else:
             v = eval_field(r, html, bu, subr)
         if f == 'coverUrl' and v and not str(v).startswith(('http', 'data:')):
@@ -855,9 +1018,22 @@ def tab_toc(src, book, url):
     toc = src.get('ruleToc', {})
     bi = src.get('ruleBookInfo', {})
     b_id = book
-    m = re.search(r'book-(\d+)', url or '')
-    if m:
-        b_id = m.group(1)
+    # ★ 从 --url 提取书籍 ID：不可写死某一站的形态（旧版写死 'book-(\d+)'，
+    #   只对 aabook 有效，换站必空 → tocUrl 展开成 'indexList-.html'）。
+    #   改为通用：先试 bookUrlPattern（书源自带，最权威），再退化为「路径中
+    #   最长的一段数字」。
+    _m = None
+    _pat = src.get('bookUrlPattern', '') or ''
+    if _pat and url:
+        _pm = re.search(_pat, url)
+        if _pm and _pm.groups():
+            _m = _pm
+    if not _m and url:
+        _cands = re.findall(r'\d{3,}', url)
+        if _cands:
+            b_id = max(_cands, key=len)
+    elif _m:
+        b_id = _m.group(1)
     # ★ 不写死站点路径：优先用 --url；否则用书源的目录地址规则自己算。
     #   旧版写死 /m/book-%s.html，只对 aabook 有效，换站必错。
     bu = url or ''
@@ -881,7 +1057,11 @@ def tab_toc(src, book, url):
     #   当成 CSS 选择器送进解析器 → SelectorSyntaxError（看着像规则写错）。
     tpl = bi.get('tocUrl', '') or ''
     if '{{' in tpl:
-        turl = expand_host_vars(tpl, bu).replace('{{id}}', b_id or '')
+        # ★ 三个占位符都要展开：{{id}} / {{bookId}} 同为书籍 ID（实测漏其一会拼出
+        #   'indexList-{{bookId}}.html' 这种字面量地址 → HTTP 000、章节 0 条，
+        #   看着像目录规则写错）。
+        b_id = b_id or ''
+        turl = expand_host_vars(tpl, bu, None).replace('{{id}}', b_id).replace('{{bookId}}', b_id)
     else:
         turl = eval_field(tpl, bh, bu, subr)
     if not turl:
