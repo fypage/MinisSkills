@@ -1,3 +1,5 @@
+> ⚠️ **实测结论（2026-10-17）**：`grok_web` 免费账号的文生视频**返回的是与 prompt 无关的演示素材**，HE 上游已知问题 `chenyme/grok2api#1014`。十次实验无一例外；同时 duration 被 cap 到 6.04 秒（`#1030`）。**当前视频通道不可用于实际交付**，只有付费 Build/Console 账号才有真实生成。
+
 # grok2api 视频通道（实测）
 
 > 站点 `https://grok.a18016.ccwu.cc`，grok2api v3.1.6，2026-10-17 实测。
