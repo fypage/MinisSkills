@@ -1,4 +1,4 @@
-# image-generator 1.3.4 评估与验收
+# image-generator 1.3.5 评估与验收
 
 ## 证据边界
 
