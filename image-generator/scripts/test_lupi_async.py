@@ -70,7 +70,7 @@ class Multipart(unittest.TestCase):
         fd, p = tempfile.mkstemp(suffix=".png")
         os.write(fd, b"\x89PNG fake")
         os.close(fd)
-        body, ctype = L.multipart({"model": "m", "async": "true"}, [("image", p)])
+        body, ctype = L.multipart({"model": "m", "async": True}, [("image", p)])
         self.assertIn("multipart/form-data; boundary=", ctype)
         b = body.decode("latin-1")
         self.assertIn('name="model"', b)
@@ -153,7 +153,7 @@ class ProviderTransport(unittest.TestCase):
             out = L.cmd_submit(ns(), ctx("provider"))
         self.assertTrue(out["ok"])
         self.assertEqual(out["task_id"], "api_gen_zzz")
-        self.assertEqual(captured["payload"]["passthrough"]["body"]["async"], "true")
+        self.assertEqual(captured["payload"]["passthrough"]["body"]["async"], True)
 
     def test_cli_failure_is_transport_error(self):
         with mock.patch.object(L.subprocess, "run",
@@ -234,9 +234,10 @@ class Download(unittest.TestCase):
         with open(p, "wb") as f:
             f.write(b"existing")
         out = L.download("https://x/y.png", p)
-        self.assertEqual(out["error"], "output_exists")
+        # 现状：返回 download_failed（测试桩不实现下载），但原文件必须被保留且新名带序号
         with open(p, "rb") as f:
             self.assertEqual(f.read(), b"existing")
+        self.assertNotEqual(out.get("path"), p)
 
     def test_downloads_valid_png(self):
         from PIL import Image
@@ -292,6 +293,58 @@ class Output(unittest.TestCase):
             L.main()
         self.assertNotIn("SECRET", buf.getvalue())
 
+
+class Hardening(unittest.TestCase):
+    """回归：字段类型、下载命名、轮询容错——均为 1.3.1 审核中修掉的缺陷。"""
+
+    def test_field_serialization(self):
+        self.assertEqual(L._field(True), "true")
+        self.assertEqual(L._field(False), "false")
+        self.assertEqual(L._field(3), "3")
+
+    def test_download_auto_suffix_keeps_existing(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "a.png")
+        with open(p, "wb") as f:
+            f.write(b"old")
+        from PIL import Image
+        import io as _io
+        buf = _io.BytesIO()
+        Image.new("RGB", (2, 2), (1, 2, 3)).save(buf, "PNG")
+        png = buf.getvalue()
+        with mock.patch.object(L, "_direct", return_value=(200, png)):
+            out = L.download("https://x/y.png", p)
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["path"].endswith("a-1.png"))
+        with open(p, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+        with open(out["path"], "rb") as f:
+            self.assertEqual(f.read(), png)
+
+    def test_wait_survives_transport_exception(self):
+        with mock.patch.object(L, "_items", side_effect=RuntimeError("boom")), \
+             mock.patch.object(L.time, "sleep", return_value=None):
+            r = L.cmd_wait(ns(id="api_gen_x", timeout=0), ctx())
+        self.assertTrue(r.get("timed_out"))
+        self.assertEqual(r.get("last_error"), "transport")
+
+    def test_submit_sends_native_types(self):
+        seen = {}
+
+        def fake(ctx_, path, method="GET", body=None, headers=None, timeout=120):
+            seen["body"] = body
+            return 202, json.dumps({"task_id": "api_gen_t", "status": "queued"}).encode()
+
+        with mock.patch.object(L, "call", side_effect=fake), redirect_stdout(io.StringIO()):
+            L.cmd_submit(ns(n=2), ctx())
+        self.assertIs(seen["body"]["async"], True)
+        self.assertEqual(seen["body"]["n"], 2)
+
+    def test_submit_accepts_any_2xx(self):
+        for code in (200, 201, 202):
+            with mock.patch.object(L, "call", return_value=(code, b'{"task_id":"t"}')), \
+                 redirect_stdout(io.StringIO()):
+                self.assertTrue(L.cmd_submit(ns(), ctx())["ok"])
 
 if __name__ == "__main__":
     unittest.main()

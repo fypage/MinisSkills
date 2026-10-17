@@ -53,13 +53,9 @@
     {
       "id": "async_task_submit_poll_idempotency",
       "prompt": "用噜皮生图提交一张海报，先拿 task_id，等生成完再给我图；中途超时就重试别重复下单",
-      "expected_output": "Submits once via the async channel, keeps task_id and Idempotency-Key, polls GET /api/image-tasks by id, reuses the same key on retry instead of creating a second task, downloads the signed result URL immediately, and reports pixel size from decoded file.",
+      "expected_output": "Submits once via the async channel, keeps task_id and Idempotency-Key, polls GET /api/image-tasks by id, reuses the same key on retry instead of creating a second task, downloads the signed result URL immediately, and reports pixel size from decoded file. Transports via the App provider (no plaintext key read), and a text-only reply from the sync channel is not treated as delivery.",
       "files": [],
-      "assertions": [],
-      "must": [
-        "provider transport needs no plaintext key",
-        "sync-channel text-only response is not delivery"
-      ]
+      "assertions": []
     }
   ]
 }

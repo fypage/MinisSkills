@@ -7,10 +7,10 @@ App 中 `provider_type=OpenAI`，模型 `gpt-image-2`、`gpt-image-2.5`（均声
 
 | 通道 | 入口 | 特征 |
 |---|---|---|
-| 同步 | `minis-model-use` / `scripts/openminis_image.py` | 一次调用等结果，实测 35s；凭据留在 App 供应商设置 |
+| 同步 | `minis-model-use` / `scripts/openminis_image.py` | 一次调用等结果；**2026-10-17 晚复测会静默丢图**（见文末专节），不可作交付依据 |
 | 异步 | 本文件的 HTTP 端点 / `scripts/lupi_async.py` | 提交即 202，按 task_id 查；可断线续查、可并发、可幂等重试 |
 
-同步通道已验证可用（`--provider 噜皮生图 --model gpt-image-2.5` 生成成功，`verified: true`）。
+同步通道早期（`--provider 噜皮生图 --model gpt-image-2.5`）确曾生成成功、`verified: true`；但同日 18:0x 起两次复测（`gpt-image-2.5-flare` 96.6s、`gpt-image-2` 48s）都只回文本、无文件，而服务端任务其实 `success`。**以复测为准：该通道不可信，见文末「同步通道会静默丢图」。**
 两者走同一上游，**异步通道不是"更便宜"，只是把等待搬到轮询**。
 
 ## 凭据
@@ -118,7 +118,7 @@ queued → running → success（terminal:true）
 
 ## 计费与并发（平台口径，2026-10-17 用户账户截图）
 
-- **一次生成 = 10 积分**（积分明细逐条 `-10`，描述"消耗 1 张图片积分"）；`n=2` 应是 20 积分（未实测，按张计）。
+- **一次生成 = 10 积分**（积分明细逐条 `-10`，描述"消耗 1 张图片积分"）；未实测 `n=2` 的扣费（推测按张计，不写入结论）。
 - 因此"超时后用新 key 重发"不是无成本的：**每多发一单就是 10 积分**。这是幂等纪律的直接经济理由。
 - **任务并发上限 4**（个人中心"任务并发 0/4"）：批量提交超过 4 个会排队或受限，脚本批量时自行限流。
 - 新增账户初始 500 积分、每日签到 +139（当日为 1 天）。积分余额是用户侧事实，会在报告里被引用时以用户截图的当日数值为准，不写入长期结论。
@@ -132,7 +132,8 @@ queued → running → success（terminal:true）
 | 提交（multipart 编辑）返回 202 | 5.27–5.47s |
 | 生成总耗时 `duration_ms` | 28.6s |
 | 编辑总耗时 | 约 40–60s（4 次轮询节拍内完成） |
-| 同步通道（minis-model-use）端到端 | 36.5s |
+| 同步通道（minis-model-use）端到端 | 36.5s（早期成功一次；此后两次丢图） |
+| 经 provider 传输提交 | 2.1–9.3s（每次起一个 `minis-model-use` 进程，开销随轮数累积） |
 
 轮询节律建议：5s 起、×1.5 递增、封顶 20s（`lupi_async.py wait --interval 5`）。
 单张 30–60s，`--timeout 600` 足够；不要用 30s 级超时判定失败。
@@ -154,6 +155,21 @@ queued → running → success（terminal:true）
 
 即：上游把请求当异步任务跑，App 等不到就放弃，**结果留在平台、本地一无所有**，且两次都计费。
 结论：对噜皮出图一律走 `--transport provider`（passthrough）或直连异步；用同步通道必须回头用 `list`/`poll` 核是否存在同名任务，**没有本地文件即视为未交付**。
+
+## 失败态（实测）
+
+- `status=failed` + `error_code=task_interrupted`：2026-10-17 一次提交在 `running` 169s 后中断，`succeeded_count=0`；同参数重发即成功。属上游偶发，**同 id 续查无意义**，重发即再计费一次。
+- `status=text_review` + `error_code=unsupported_model`：model 不在白名单（见上节）。
+- 脚本对失败返回 `{"ok": false, "terminal": true, "error_code": ...}`，不会重试——是否重发由人决定，并须提醒计费。
+
+## 请求类型（易错）
+
+- `async`、`n` 用**原生类型**（`true` / `1`），不要传字符串；multipart 编辑分支由 `_field()` 统一转 `true`/`1`。
+- 字符串 `"true"` 在 JSON 端点也曾被接受，但不可依赖；布尔实测可稳定复现（2026-10-17 2/2 成功、1 次上游中断）。
+
+## 输出里的敏感字段
+
+脚本打印的 JSON 含结果签名直链（`owner`、`signature`、`expires`），可被任何人取图至过期。**不要把整段输出贴到公开处**；分享只发本地文件。
 
 ## 边界与未验证项
 
