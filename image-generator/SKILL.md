@@ -1,7 +1,7 @@
 ---
 name: image-generator
 description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询/列表/取消、Idempotency-Key 幂等重试，可经 App 供应商转发而无需明文 Key）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.3.5
+version: 1.3.6
 compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600），一律不外显。
 ---
 
@@ -18,7 +18,7 @@ compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output�
 7. 只有成功保存并解码的真实图片才能交付；模型文字响应或改写后的提示词不算图片。
 8. 提交后以 `task_id` / `Idempotency-Key` 为凭据续查，不以"等太久"判定失败；重试复用同一幂等键，不另起新任务。
 9. `results[].width/height` 与本地解码是唯一的像素事实；供应商的 `size` 请求值可能被上游改写（噜皮实测 1024x1024 → 1254x1254）。
-10. **交付必附六行生图信息**（站点／模型／清晰度／比例／耗时／文件），以 `yaml` 围栏整块输出，保证可一键复制。不得压成单行概括，不得省略任一行，`文件` 不得写“约 2.35 MB”这类估算——须给格式与精确字节数。无此块即视为交付不完整。
+10. **交付必附六行生图信息**（站点／模型／清晰度／比例／耗时／文件），写成普通段落、值套行内代码、`文件` 给可点链接——不进代码围栏。不得压成单行概括，不得省略任一行，`文件` 不得写“约 2.35 MB”这类估算，须给格式与精确字节数。缺此六行即视为交付不完整。
 
 ## 按需参考
 
@@ -178,7 +178,7 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 
 ## 输出格式
 
-> **铁律**：图必有块。任何产图回复都要以六行 `yaml` 生图信息收尾，缺行、压成一行、或只有文字约数（如“约 2.35 MB”），都算交付未完成。
+> **铁律**：图必有条。任何产图回复都要以六行生图信息收尾——**普通段落，不进代码围栏**，值用行内代码，`文件` 一行给可点链接。缺行、压成一行、或只有文字约数（如“约 2.35 MB”），都算交付未完成。
 
 每张图片以内联方式显示：
 
@@ -186,18 +186,16 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 ![生成图片]({minis_url})
 ```
 
-随后给出（**必须用带语言标记的围栏 `yaml`，客户端才会渲染成高亮、可一键复制的块；空围栏或普通段落没有复制按钮**）：
+随后给出（**照此排列，写成普通段落**——值套行内代码呈高亮，`文件` 用链接；不要塞进代码围栏，那样会变成一整块黑底代码，不便阅读）：
 
-```yaml
-生图信息
+**生图信息**
 
-站点：{provider}
-模型：{model}
-清晰度：{actual_width}×{actual_height}
-比例：{actual_aspect}
-耗时：{elapsed}
-文件：{format}｜{bytes} 字节
-```
+站点：`{provider}`
+模型：`{model}`
+清晰度：`{actual_width}×{actual_height}`
+比例：`{actual_aspect}`
+耗时：`{elapsed}`
+文件：[{format} 原图]({minis_url})｜`{bytes}` 字节
 
 排列固定为以上六行：`站点` 写上游品牌（与供应商标签不同时，括号补注供应商）；`清晰度` 用全角 `×` 连接，不写 `x`；`比例` 写约分后的 `W:H`；`耗时` 用中文单位（如 `51 秒`）；`文件` 写格式与字节数，须与落盘文件一致。`质量` 默认不出，仅在有返回证据时追加一行。块外另给一行可点的文件链接（`文件：[原图 PNG](minis://...)`），便于直接打开或保存。
 
