@@ -15,16 +15,30 @@ App 中 `provider_type=OpenAI`，模型 `gpt-image-2`、`gpt-image-2.5`（均声
 
 ## 凭据
 
-- 解析顺序：`--key-file` > `$LUPI_API_KEY` > `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）。
-- 形如 `lupi_<32 hex>`；无效时 `401`，响应体：
+- **首选 `--transport provider`**：脚本不接触明文 Key，改由 App 里已配置的供应商（instance_label `噜皮生图`）发 passthrough 请求。`minis-model-use run --model '噜皮生图/gpt-image-2'` + `passthrough.endpoint` 会把路径替换到该供应商 base 之后，实测 `GET /v1/models` → 200、`POST /v1/images/generations` → 202，与直连等价。Key 只在 App 供应商设置里存在，不落盘、不进会话。
+- 直连解析顺序：`--key-file` > `$LUPI_API_KEY` > `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）。
+- 形如 `lupi_<32 hex>`；无效/已吊销时 `401`，响应体：
 
 ```json
 {"error":{"message":"密钥无效或已失效，请重新登录","type":"authentication_error","param":null,"code":"invalid_api_key"}}
 ```
 
-- 文档/日志/报告只记路径与变量名，不回显值。
+- 文档/日志/报告只记路径与变量名，不回显值；直链里的 `owner`/`signature`/`expires` 一并按敏感处理。
+- ★Key 一旦进入对话（含被压缩摘要带出），视为已泄漏：立即在平台重置，旧值 `401` 即为吊销成功。
 
-## 三个端点
+## 端点清单
+
+| 方法 | 路径 | 实测 |
+|---|---|---|
+| POST | `/v1/images/generations` | JSON，`async:true` → `202` |
+| POST | `/v1/images/edits` | multipart，字段名 `image`；仅直连可用（provider 传输不支持 multipart） |
+| GET | `/api/image-tasks?ids=a,b` | 200，逗号多 id |
+| GET | `/api/image-tasks?limit=N` | 200，列最近任务（无 ids 时等同列表；`limit` 生效与否未逐一核，返回按时间倒序） |
+| POST | `/api/image-tasks/<id>/cancel` | 200，body 须非空（`{}` 会被 provider 传输拒；直连可空）；对已终态任务返 200 但状态不变 |
+| DELETE | `/api/image-tasks/<id>` | 405 |
+| GET | `/api/image-tasks/<id>` | 200 但返回 SPA HTML —— **无路径式单 id 端点**，必须走 `?ids=` |
+
+## 三个核心端点
 
 ### 1) 提交生成
 
@@ -123,9 +137,28 @@ queued → running → success（terminal:true）
 轮询节律建议：5s 起、×1.5 递增、封顶 20s（`lupi_async.py wait --interval 5`）。
 单张 30–60s，`--timeout 600` 足够；不要用 30s 级超时判定失败。
 
+## 模型白名单（服务端返回）
+
+`codex-gpt-image-2`、`gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`plus-codex-gpt-image-2`、`pro-codex-gpt-image-2`、`team-codex-gpt-image-2`
+
+★ **非法 model 不会被 400 拒绝**：实测 `model: "not-a-model"` 仍返回 `202` 并建任务，随后状态是 `text_review`、`error_code=unsupported_model`、`succeeded_count=0`，`public_error` 里才列出白名单。故提交前先核对 `/v1/models`，别靠错因反查。
+
+## ★同步通道会静默丢图（2026-10-17 实测）
+
+`minis-model-use run`（provider `噜皮生图`，顶层 `prompt/n/size` 图片风格）：
+
+| 次 | 模型 | App 侧返回 | 服务端实况 |
+|---|---|---|---|
+| 1 | gpt-image-2.5-flare | 96.6s 后只回 prompt 文本，无图片文件 | 后台任务成功出图 |
+| 2 | gpt-image-2 | 48s 后同上 | `api_gen_f46aa398…` = `success` / 40.3s / `succeeded_count 1` |
+
+即：上游把请求当异步任务跑，App 等不到就放弃，**结果留在平台、本地一无所有**，且两次都计费。
+结论：对噜皮出图一律走 `--transport provider`（passthrough）或直连异步；用同步通道必须回头用 `list`/`poll` 核是否存在同名任务，**没有本地文件即视为未交付**。
+
 ## 边界与未验证项
 
-- **未验证**：取消任务的实际端点（`actions.cancel` 存在但接口未见）、历史任务列表、`n>1` 的 `results` 多图结构、`b64_json` 模式、多参考图 edits、非 `auto` 的 `quality`/`size` 取值域。
+- 已验证（2026-10-17 补）：`GET /api/image-tasks?limit=N` 列表、`POST /api/image-tasks/<id>/cancel`、`DELETE` 405、路径式单 id 不存在、模型白名单、provider 传输等价性。
+- **未验证**：`n>1` 的 `results` 多图结构、`b64_json` 模式、多参考图 edits、非 `auto` 的 `quality`/`size` 取值域、`limit`/分页参数是否真正生效。
 - 计费口径未知，不声称"失败不计费"。失败任务只能据 `error_code`/`public_error` 报告。
 - 提交后超时/连接重置 = 结果不确定：先按 `Idempotency-Key` 重放取回 task_id，再轮询；**不要另起新 key 重发**。
 - 该平台是第三方中转站，凭据与政策随时可变；每次大任务前先跑一次 `poll` 或一次小尺寸试提交确认可用性。

@@ -1,8 +1,8 @@
 ---
 name: image-generator
-description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询、Idempotency-Key 幂等重试）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.3.0
-compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步直连通道的凭据只来自 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600），不外显。
+description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询/列表/取消、Idempotency-Key 幂等重试，可经 App 供应商转发而无需明文 Key）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
+version: 1.3.1
+compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600），一律不外显。
 ---
 
 # OpenMinis 图像生成与编辑
@@ -101,18 +101,24 @@ python3 /var/minis/skills/image-generator/scripts/openminis_image.py edit \
 当供应商支持异步任务（当前：噜皮生图 `image.mlgb7.com`），或用户明确要求"提交后拿 task_id、稍后取结果"时，走 HTTP 异步通道，脚本：
 
 ```sh
-# 提交（返回 202 + task_id；默认生成新 Idempotency-Key）
+# 首选：经 App 已配置的供应商转发（无需明文 Key；见下方第 7 条）
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py --transport provider submit \
+  --prompt "一张极简产品海报" --size 1024x1024 --n 1
+
+# 提交（直连；默认生成新 Idempotency-Key）——仅在确已配置 $LUPI_API_KEY 时使用
 python3 /var/minis/skills/image-generator/scripts/lupi_async.py submit \
   --mode generate --prompt "一张极简产品海报" --size 1024x1024 --n 1
 
-# 编辑（multipart，本地参考图）
+# 编辑（multipart，本地参考图；multipart 只走直连）
 python3 /var/minis/skills/image-generator/scripts/lupi_async.py submit \
   --mode edit --image /var/minis/attachments/ref.png --prompt "改成未来城市夜景"
 
-# 按 task_id 查询（支持逗号分隔多个）
+# 按 task_id 查询（支持逗号分隔多个）/ 列最近任务 / 取消
 python3 /var/minis/skills/image-generator/scripts/lupi_async.py poll --ids api_gen_xxx,api_edit_yyy
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py list --limit 10
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py cancel --id api_gen_xxx
 
-# 等终态并落盘（5s 起、×1.5 递增、封顶 20s；超时标 ambiguous，不重发）
+# 等终态并落盘（5s 起、×1.5 递增、封顶 20s；超时标 ambiguous，不重发；多图自动编号）
 python3 /var/minis/skills/image-generator/scripts/lupi_async.py wait \
   --id api_gen_xxx --timeout 600 --download --output poster.png
 ```
@@ -123,9 +129,10 @@ python3 /var/minis/skills/image-generator/scripts/lupi_async.py wait \
 2. 网络超时/连接重置后的重试：**复用原 `Idempotency-Key`**（同值实测返回同一 task_id），换新任务才换新 key。不要用新 key 重发一次，那等于再买一张。
 3. 终态判 `terminal:true` 或 `status ∈ {success, failed, error, cancelled}`；`failed` 也是终态，要报 `error_code`/`public_error`，不是继续等。
 4. 拿到 `results[].url` 立即下载：直链带 `expires`（实测为生成次日 UTC 00:00）且拒 `Python-urllib` 默认 UA（403）。`lupi_async.py` 已按 `curl/8.5.0` 取图并 Pillow 解码验证。
-5. 异步与同步（`minis-model-use`）同源同价同上游，异步不是"更省"，只是把等待搬到轮询；单张结果仍 30–60s。
-6. 计费：该站**一次生成 10 积分**、并发上限 4；重发一单就是再花 10 积分，故幂等复用不是可选优化。
-7. 凭据由 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）注入；文档、日志、交付里不回显。
+5. ★**该站的普通（同步）调用会静默丢图**：`minis-model-use run` 以图片风格参数调用时，上游实际在后台跑成了任务（18:11 那次 `success` 40s、出图 1 张），但 App 侧 48–96s 后只把 prompt 文本当结果返回、不留图片文件。故对噜皮一律走 `--transport provider` 或直连异步，**不要用同步通道出图后宣称"已生成"**（无本地文件即视为未交付）。
+6. 异步与直连同源同价同上游，异步不是"更省"，只是把等待搬到轮询；单张结果仍 30–60s。
+7. 计费：该站**一次生成 10 积分**、并发上限 4；重发一单就是再花 10 积分，故幂等复用不是可选优化。同步失败那两次也已计费。
+8. 凭据优先级：**provider 传输**（App 供应商设置里的 Key，脚本根本不接触明文）＞ `$LUPI_API_KEY` ＞ `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）。文档、日志、交付里一律不回显；直链里的 `owner`/`signature` 同样当敏感值截断。
 
 端点、响应字段、状态机与未验证项见 `references/lupi-async-api.md`。
 
