@@ -1,7 +1,7 @@
 ---
 name: image-generator
 description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询/列表/取消、Idempotency-Key 幂等重试，可经 App 供应商转发而无需明文 Key）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.5.0
+version: 1.5.1
 compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）；grok2api 走 `$GROK2API_KEY` 或 `/var/minis/shared/grok2api/admin.txt` 的 CLIENT_KEY 行。一律不外显。
 ---
 
@@ -166,6 +166,7 @@ python3 scripts/grok_video.py status --id video_xxx
 python3 scripts/grok_video.py wait --id video_xxx --download --json
 ```
 
+0. ⚠️ **先看这条**：`grok_web` 免费账号的文生视频返回**与 prompt 无关的演示素材**（上游 issue `chenyme/grok2api#1014`，我们十次实测全中，苹果 prompt 出湖泊、浴池出农夫市集）。**HTTP 200 + done ≠ 内容正确**，交付前必须抽帧核对画面；免费账号下这条通道实际不可用。
 1. **两段式**：`POST /v1/videos/generations` 只回 `request_id`；`GET /v1/videos/{id}` 查 `status/progress`，`done` 后取 `video.url`。
 2. ★**duration 1–15 只是入参范围，Web 路由恒出 6.04 秒**（8/10/15 各测一次，全是 6.041667）。
 3. ★**只有 720p 能用**：`480p` → 503 `upstream_model_unavailable`，`1080p` → 400（要求路由到 Console，而我们没有 Console 账号）。实测比例档：`16:9→1280×720`、`9:16→720×1280`、`1:1→720×720`、`4:3→960×720`。
