@@ -62,7 +62,15 @@ minis-model-use list --modality image_output
 
 此适配只在运行时供应商标签精确匹配时启用。仅支持 n=1；size 作为提示词并警告，不保证像素；非默认 quality、resolution、response-format 及 extra-body 拒绝。默认 response-format=url 也不控制工具响应格式。若供应商改名或协议升级，应先做一次受控验证，再更新脚本与测试。
 
-## 包装器能力边界（v1.2.1）
+### 噜皮生图（image.mlgb7.com）
+
+App 中的 `instance_label=噜皮生图`，`provider_type=OpenAI`，模型 `gpt-image-2` / `gpt-image-2.5`。同步通道（`minis-model-use`、标准顶层 `prompt/size/quality/n`）实测可用，端到端约 35s。
+
+除此之外它另开了一条**异步任务通道**：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart，字段名 `image`）在带 `"async":true` 时返回 `202` + `task_id` + `poll_url`，用 `GET /api/image-tasks?ids=<id[,id]>` 查终态；`Idempotency-Key` 同值重放返回同一 task_id（已实测）。实现与实测细节见 `lupi-async-api.md`，脚本 `scripts/lupi_async.py`。
+
+两条通道共用同一上游：异步不代表更便宜或更快出图，只适合断线续查、批量并发与已明确要 task_id 的场景。该站返回的 `size` 不保证生效（`1024x1024` 实测出 1254×1254），像素一律以 `results[].width/height` 和本地解码为准。
+
+## 包装器能力边界（v1.3.0）
 
 以下是实现契约与验收目标，不代表本次修复已通过全部验收；以离线回归结果及 `evals/acceptance.md` 的工具轨迹为证。远端在线、计费、实际参数支持与视觉效果均不能由本地测试证明。
 

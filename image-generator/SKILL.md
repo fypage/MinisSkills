@@ -1,25 +1,28 @@
 ---
 name: image-generator
-description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.2.1
-compatibility: OpenMinis Android 0.18+；使用 minis-model-use image_output；凭据留在 App 供应商设置中。
+description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询、Idempotency-Key 幂等重试）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
+version: 1.3.0
+compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步直连通道的凭据只来自 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600），不外显。
 ---
 
 # OpenMinis 图像生成与编辑
 
 ## 核心原则
 
-1. 通过 `minis-model-use` 调用用户已配置的 `image_output` 模型；不索取或输出 API Key。
+1. 主通道通过 `minis-model-use` 调用用户已配置的 `image_output` 模型；不索取或输出 API Key。异步直连通道只能读取用户已提供的凭据环境变量或 shared 凭据文件，绝不在文档、日志、交付中回显。
 2. 实际生图前动态查询模型，不把临时供应商状态当作长期事实。
 3. 用户指定模型/供应商时不擅自替换；未指定时才自动选择可用路由。
 4. 参考图在本机预处理，以 data URI 随请求发送给所选模型供应商；未经明确同意不上传公共临时图床。
-5. 默认先生成 1 张；多张可能独立计费，用户明确要求后再增加。
+5. 默认先生成 1 张；多张独立计费（噜皮生图 1 张 = 10 积分），用户明确要求后再增加。
 6. 超时、502、524、连接重置属于结果不确定，不自动重试或切换付费供应商。
 7. 只有成功保存并解码的真实图片才能交付；模型文字响应或改写后的提示词不算图片。
+8. 提交后以 `task_id` / `Idempotency-Key` 为凭据续查，不以"等太久"判定失败；重试复用同一幂等键，不另起新任务。
+9. `results[].width/height` 与本地解码是唯一的像素事实；供应商的 `size` 请求值可能被上游改写（噜皮实测 1024x1024 → 1254x1254）。
 
 ## 按需参考
 
 - 供应商协议、特殊路由和费用失败边界：`references/provider-compat.md`
+- 噜皮生图异步任务通道（提交 202 / 按 task_id 查询 / `Idempotency-Key` / 直链 UA 与签名时效）：`references/lupi-async-api.md`
 - 提示词编排、编辑保留项、文字/Logo、巨物题材：`references/prompt-recipes.md`
 - 历史智画创任务恢复：`references/wisart-api.md`（仅历史资料，不代表当前状态）
 - GRSAI 未并入后端审计：`references/grsai-option-audit.md`
@@ -93,6 +96,39 @@ python3 /var/minis/skills/image-generator/scripts/openminis_image.py edit \
 
 `--extra-body` 仅用于已核对文档的非核心扩展字段；不得借此覆盖模型、数量、提示词、参考图或请求路由。对不支持的参数停止或明确提示，不得把忽略的参数声称为已生效。
 
+### 3b. 异步通道（长耗时 / 断线续查 / 并发）
+
+当供应商支持异步任务（当前：噜皮生图 `image.mlgb7.com`），或用户明确要求"提交后拿 task_id、稍后取结果"时，走 HTTP 异步通道，脚本：
+
+```sh
+# 提交（返回 202 + task_id；默认生成新 Idempotency-Key）
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py submit \
+  --mode generate --prompt "一张极简产品海报" --size 1024x1024 --n 1
+
+# 编辑（multipart，本地参考图）
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py submit \
+  --mode edit --image /var/minis/attachments/ref.png --prompt "改成未来城市夜景"
+
+# 按 task_id 查询（支持逗号分隔多个）
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py poll --ids api_gen_xxx,api_edit_yyy
+
+# 等终态并落盘（5s 起、×1.5 递增、封顶 20s；超时标 ambiguous，不重发）
+python3 /var/minis/skills/image-generator/scripts/lupi_async.py wait \
+  --id api_gen_xxx --timeout 600 --download --output poster.png
+```
+
+纪律：
+
+1. 提交后**必须**拿到 `task_id`（与 `id` 同值）与 `poll_url`；只拿到 HTTP 202 不算有结果。
+2. 网络超时/连接重置后的重试：**复用原 `Idempotency-Key`**（同值实测返回同一 task_id），换新任务才换新 key。不要用新 key 重发一次，那等于再买一张。
+3. 终态判 `terminal:true` 或 `status ∈ {success, failed, error, cancelled}`；`failed` 也是终态，要报 `error_code`/`public_error`，不是继续等。
+4. 拿到 `results[].url` 立即下载：直链带 `expires`（实测为生成次日 UTC 00:00）且拒 `Python-urllib` 默认 UA（403）。`lupi_async.py` 已按 `curl/8.5.0` 取图并 Pillow 解码验证。
+5. 异步与同步（`minis-model-use`）同源同价同上游，异步不是"更省"，只是把等待搬到轮询；单张结果仍 30–60s。
+6. 计费：该站**一次生成 10 积分**、并发上限 4；重发一单就是再花 10 积分，故幂等复用不是可选优化。
+7. 凭据由 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）注入；文档、日志、交付里不回显。
+
+端点、响应字段、状态机与未验证项见 `references/lupi-async-api.md`。
+
 ### 4. 验证
 
 包装器应完成：
@@ -125,7 +161,8 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 
 - 本地参数、文件不存在、MIME 不支持、路径越界：修正后可重试，因为尚未提交模型任务。
 - 明确的模型不存在、参数拒绝：停止；不自动换付费供应商。只有提交前错误或可靠终态证据才能确认未执行。
-- 502/503/524/读取超时/连接重置及其他提交后不明错误：报告“结果不确定”，附任务日志；不自动重试。
+- 提交后不明错误但已拿到 `task_id`：先用该 id 续查（`lupi_async.py poll`），有终态就按终态交付；无终态才标不确定。
+- 502/503/524/读取超时/连接重置及其他提交后不明错误：报告“结果不确定”，附任务日志；不自动重试。异步通道的下一次重试必须复用原 `Idempotency-Key`，不得换新 key 再发一单。
 - 输出不是图片或无法解码：拒绝交付，不把错误文件改扩展名冒充图片。
 - 多图只返回一张：只交付实际得到的图片，说明与请求数量差异，不擅自补发任务。
 
@@ -160,7 +197,7 @@ python3 /var/minis/skills/image-generator/scripts/browser_recover.py \
 ```sh
 cd /var/minis/skills/image-generator
 BROWSER_RECOVER_LIVE_TEST=0 python3 -m unittest discover -s scripts -p 'test_*.py' -v
-python3 -m py_compile scripts/openminis_image.py scripts/browser_recover.py
+python3 -m py_compile scripts/openminis_image.py scripts/browser_recover.py scripts/lupi_async.py
 ```
 
 测试不得实际发起付费生图；模型调用一律 mock。浏览器真机探针须另行显式启用，不能混称为离线测试。
