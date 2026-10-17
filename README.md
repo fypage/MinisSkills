@@ -6,7 +6,7 @@ Reusable skills for [Open Minis](https://openminis.app/) / Minis agent workflows
 
 | Skill | Description |
 |---|---|
-| [`image-generator`](./image-generator/) | Generate or edit images through OpenMinis `minis-model-use`, with WisArt parameters and recovery guidance. |
+| [`image-generator`](./image-generator/) | Generate or edit images through OpenMinis `minis-model-use`; includes an async task channel (202 + `task_id` polling, `Idempotency-Key` idempotent retry) with verified download. |
 | [`github-sync-helper`](./github-sync-helper/) | Safe Git/GitHub workflows for repositories, PRs, Issues, Releases and Actions. |
 | [`cloudflare-dns`](./cloudflare-dns/) | Manage and verify Cloudflare DNS records with `flarectl`. |
 | [`self-improving-agent`](./self-improving-agent/) | Structured reusable learning/error/feature logging workflows; runtime logs are excluded. |
