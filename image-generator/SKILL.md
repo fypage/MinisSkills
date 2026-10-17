@@ -1,7 +1,7 @@
 ---
 name: image-generator
 description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询/列表/取消、Idempotency-Key 幂等重试，可经 App 供应商转发而无需明文 Key）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.4.0
+version: 1.5.0
 compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）；grok2api 走 `$GROK2API_KEY` 或 `/var/minis/shared/grok2api/admin.txt` 的 CLIENT_KEY 行。一律不外显。
 ---
 
@@ -25,6 +25,7 @@ compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output�
 - 供应商协议、特殊路由和费用失败边界：`references/provider-compat.md`
 - 噜皮生图异步任务通道（提交 202 / 按 task_id 查询 / `Idempotency-Key` / 直链 UA 与签名时效）：`references/lupi-async-api.md`
 - grok2api 图片通道（同步、模型与比例白名单、实测像素档、公开媒体 URL、编辑仅 JSON）：`references/grok2api-image.md`
+- grok2api 视频通道（异步 request_id、轮询、实测时长与分辨率边界）：`references/grok2api-video.md`
 - 提示词编排、编辑保留项、文字/Logo、巨物题材：`references/prompt-recipes.md`
 - 历史智画创任务恢复：`references/wisart-api.md`（仅历史资料，不代表当前状态）
 - GRSAI 未并入后端审计：`references/grsai-option-audit.md`
@@ -156,6 +157,24 @@ python3 scripts/grok_image.py edit --prompt "…" --image-url https://…/v1/med
 4. 编辑端点仅 JSON、`image.url` 必须是**公网可读**地址（`file_id` 不支持）；可直接用上一次生成的媒体 URL 回灌，实测可行；Web 编辑限 `n=1`。
 5. **媒体 URL 不带 key 也能打开**（实测 `noauth=200`）——拿到链接即可看图。交付前先下载到本地再内嵌，别把媒体 URL 贴到公开场合。
 6. 同步失败没有幂等键：超时/断流等于结果不确定，重发就是新任务，不自动重试。
+
+### 3d. Grok Imagine 视频（grok2api，异步通道）
+
+```sh
+python3 scripts/grok_video.py gen --prompt "…" --ratio 16:9 --resolution 720p --json
+python3 scripts/grok_video.py status --id video_xxx
+python3 scripts/grok_video.py wait --id video_xxx --download --json
+```
+
+1. **两段式**：`POST /v1/videos/generations` 只回 `request_id`；`GET /v1/videos/{id}` 查 `status/progress`，`done` 后取 `video.url`。
+2. ★**duration 1–15 只是入参范围，Web 路由恒出 6.04 秒**（8/10/15 各测一次，全是 6.041667）。
+3. ★**只有 720p 能用**：`480p` → 503 `upstream_model_unavailable`，`1080p` → 400（要求路由到 Console，而我们没有 Console 账号）。实测比例档：`16:9→1280×720`、`9:16→720×1280`、`1:1→720×720`、`4:3→960×720`。
+4. ★**图生视频与 `reference_images`/`reference_audios` 在 Web 路由不可用**（503，需 Build/Console 账号）；参数合法、通道未开，别当脚本错。
+5. 生成很快：约 6.6 秒出片，文件 3–4 MB（h264+aac）。
+6. 视频媒体 URL 同样**公开可读**（实测无 key 206），交付前下载到本地再播放。
+7. 编辑/延长（`/v1/videos/edits`、`/extensions`）同样只吃 Console，当前不可用。
+
+协议细节与实测边界见 `references/grok2api-video.md`。
 
 ### 4. 验证
 
