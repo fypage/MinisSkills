@@ -91,18 +91,16 @@ Recovery matching must use `created_at >= request_started_at` and exact `prompt/
 
 ## Display metadata
 
-Prefer actual saved image dimensions over requested resolution tier. 统一按 SKILL.md 的六行排列输出（围栏用 `yaml`，客户端才给复制按钮）：
+Prefer actual saved image dimensions over requested resolution tier. 统一按 SKILL.md 的六行排列输出：**普通段落、值套行内代码、文件给链接，不进代码围栏。**
 
-```yaml
-生图信息
+**生图信息**
 
-站点：智画创
-模型：gpt-image-2
-清晰度：1024×1536
-比例：2:3
-耗时：147 秒
-文件：PNG｜2,628,318 字节
-```
+站点：`智画创`
+模型：`gpt-image-2`
+清晰度：`1024×1536`
+比例：`2:3`
+耗时：`147 秒`
+文件：[PNG 原图](minis://attachments/xxx.png)｜`2628318` 字节
 
 - 尺寸用全角 `×`，比例写约分结果；`9:16` 这类近似档只在精确比值明显不等时补“约”。
 - `耗时` 以上游 `elapsed_ms`（含排队）为准；卡片上的秒数常只计生成阶段，二者可差近三倍，取数须注明口径。
