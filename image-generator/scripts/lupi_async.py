@@ -53,6 +53,8 @@ class Ctx:
 
 def resolve_key(args) -> str | None:
     if args.key_file:
+        if not os.path.exists(args.key_file):
+            raise SystemExit(f"key file not found: {args.key_file}")
         with open(args.key_file, "r", encoding="utf-8") as f:
             k = f.read().strip()
         if k:
@@ -90,6 +92,8 @@ def _direct(url: str, data: bytes | None, headers: dict, timeout: int):
         return e.code, e.read()
     except urllib.error.URLError as e:  # 连接层失败：结构化返回，不抛栈
         return -1, json.dumps({"transport_error": str(e.reason)[:200]}).encode()
+    except (TimeoutError, OSError) as e:  # socket 超时不会包进 URLError
+        return -1, json.dumps({"transport_error": f"{type(e).__name__}: {e}"[:200]}).encode()
 
 
 def _provider(ctx: Ctx, path: str, method: str, body: dict | None,
@@ -104,11 +108,17 @@ def _provider(ctx: Ctx, path: str, method: str, body: dict | None,
         inp, out = os.path.join(td, "in.json"), os.path.join(td, "out.bin")
         with open(inp, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        cp = subprocess.run(["minis-model-use", "run", "--model", ctx.provider_model,
-                             "--input", inp, "--output", out],
-                            capture_output=True, text=True, timeout=timeout + 60)
+        try:
+            cp = subprocess.run(["minis-model-use", "run", "--model", ctx.provider_model,
+                                 "--input", inp, "--output", out],
+                                capture_output=True, text=True, timeout=timeout + 60)
+        except subprocess.TimeoutExpired:
+            return -1, json.dumps({"transport_error": "minis-model-use timed out"}).encode()
+        except FileNotFoundError:
+            return -1, json.dumps({"transport_error": "minis-model-use not found"}).encode()
         if cp.returncode != 0:
-            return -1, json.dumps({"transport_error": (cp.stderr or cp.stdout)[-300:]}).encode()
+            hint = f" (provider {ctx.provider_model!r} unavailable; pass --provider-model '<label>/<model_id>')"
+            return -1, json.dumps({"transport_error": (cp.stderr or cp.stdout)[-260:] + hint}).encode()
         try:
             meta = json.loads(cp.stdout)
         except Exception:
@@ -136,11 +146,18 @@ def call(ctx: Ctx, path: str, method: str = "GET", body: dict | None = None,
     return _direct(BASE + path, data, h, timeout)
 
 
+def _field(v) -> str:
+    """表单字段统一成服务端认的字符串：布尔用 true/false，数字用十进制。"""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
 def multipart(fields: dict, files: list[tuple[str, str]]) -> tuple[bytes, str]:
     boundary = "----bf" + uuid.uuid4().hex
     out = bytearray()
     for k, v in fields.items():
-        out += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+        out += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{_field(v)}\r\n".encode()
     for name, path in files:
         fn = os.path.basename(path)
         ctype = mimetypes.guess_type(fn)[0] or "application/octet-stream"
@@ -154,8 +171,8 @@ def multipart(fields: dict, files: list[tuple[str, str]]) -> tuple[bytes, str]:
 
 def cmd_submit(a, ctx: Ctx) -> dict:
     iid = a.idempotency_key or ("bf-" + uuid.uuid4().hex)
-    common = {"model": a.model, "prompt": a.prompt, "n": str(a.n),
-              "response_format": "url", "async": "true"}
+    common = {"model": a.model, "prompt": a.prompt, "n": int(a.n),
+              "response_format": "url", "async": True}
     if a.size:
         common["size"] = a.size
     if a.quality:
@@ -179,7 +196,7 @@ def cmd_submit(a, ctx: Ctx) -> dict:
         payload = json.loads(raw.decode("utf-8", "replace"))
     except Exception:
         payload = {"raw_head": raw[:200].decode("utf-8", "replace")}
-    out = {"ok": status in (200, 202), "http": status, "elapsed": elapsed,
+    out = {"ok": 200 <= status < 300, "http": status, "elapsed": elapsed,
            "idempotency_key": iid, "mode": a.mode, "transport": ctx.transport}
     if 200 <= status < 300:
         out["task_id"] = payload.get("task_id") or payload.get("id")
@@ -198,7 +215,7 @@ def summarize(item: dict) -> dict:
     return {
         "id": item.get("id"),
         "status": item.get("status"),
-        "terminal": item.get("terminal", item.get("status") in TERMINAL_TRUE),
+        "terminal": bool(item.get("terminal")) or item.get("status") in TERMINAL_TRUE,
         "stage": item.get("stage_label") or item.get("stage_code"),
         "mode": item.get("mode"),
         "model": item.get("model"),
@@ -255,8 +272,12 @@ def cmd_cancel(a, ctx: Ctx) -> dict:
 
 
 def download(url: str, output: str) -> dict:
-    if os.path.exists(output):
-        return {"ok": False, "error": "output_exists", "path": output}
+    # 已存在则自动加序号，不覆盖既有产物，也不因此判失败
+    base, ext = os.path.splitext(output)
+    i = 1
+    while os.path.exists(output):
+        output = f"{base}-{i}{ext}"
+        i += 1
     status, raw = _direct(url, None, {"User-Agent": UA}, 180)
     if status != 200 or not raw:
         return {"ok": False, "error": "download_failed", "http": status}
@@ -299,7 +320,11 @@ def cmd_wait(a, ctx: Ctx) -> dict:
     interval = a.interval
     last = None
     while True:
-        r = _items(ctx, f"/api/image-tasks?ids={a.id}")
+        try:
+            r = _items(ctx, f"/api/image-tasks?ids={a.id}")
+        except Exception as e:  # 网络/解析异常不得丢 task_id：继续等到超时
+            r = {"ok": False, "error": "transport", "detail": str(e)[:160]}
+        last_err = None if r.get("ok") else r.get("error") or r.get("http")
         if r.get("ok") and r.get("items"):
             item = r["items"][0]
             last = item
@@ -312,6 +337,7 @@ def cmd_wait(a, ctx: Ctx) -> dict:
                 return out
         if time.time() >= deadline:
             return {"ok": False, "timed_out": True, "ambiguous": True, "last": last,
+                    "last_error": last_err,
                     "note": "超时不代表远端失败；用同一 task_id 续查，勿重复提交"}
         time.sleep(interval)
         interval = min(interval * 1.5, 20)
