@@ -1,8 +1,8 @@
 ---
 name: image-generator
 description: 通过用户在 OpenMinis 中配置的 image_output 模型生成或编辑图片；适用于生图、画图、文生图、图生图、改图、局部修改、海报、Logo、产品图、角色图、风格迁移和多参考图编辑；支持异步任务通道（提交拿 task_id、按 id 查询/列表/取消、Idempotency-Key 幂等重试，可经 App 供应商转发而无需明文 Key）。自动核对可用模型，本地处理参考图，将结果保存到 /var/minis/attachments，验证真实图片与尺寸，并以内联媒体和可核实元数据交付。
-version: 1.3.6
-compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600），一律不外显。
+version: 1.4.0
+compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output，凭据留在 App 供应商设置中；异步通道优先经供应商转发（脚本不接触明文 Key），直连时才用 `$LUPI_API_KEY` 或 `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）；grok2api 走 `$GROK2API_KEY` 或 `/var/minis/shared/grok2api/admin.txt` 的 CLIENT_KEY 行。一律不外显。
 ---
 
 # OpenMinis 图像生成与编辑
@@ -24,6 +24,7 @@ compatibility: OpenMinis Android 0.18+；主通道 minis-model-use image_output�
 
 - 供应商协议、特殊路由和费用失败边界：`references/provider-compat.md`
 - 噜皮生图异步任务通道（提交 202 / 按 task_id 查询 / `Idempotency-Key` / 直链 UA 与签名时效）：`references/lupi-async-api.md`
+- grok2api 图片通道（同步、模型与比例白名单、实测像素档、公开媒体 URL、编辑仅 JSON）：`references/grok2api-image.md`
 - 提示词编排、编辑保留项、文字/Logo、巨物题材：`references/prompt-recipes.md`
 - 历史智画创任务恢复：`references/wisart-api.md`（仅历史资料，不代表当前状态）
 - GRSAI 未并入后端审计：`references/grsai-option-audit.md`
@@ -138,6 +139,23 @@ python3 /var/minis/skills/image-generator/scripts/lupi_async.py wait \
 8. 凭据优先级：**provider 传输**（App 供应商设置里的 Key，脚本根本不接触明文）＞ `$LUPI_API_KEY` ＞ `/var/minis/shared/image-gen/lupi-api-key.txt`（0600）。文档、日志、交付里一律不回显；直链里的 `owner`/`signature` 同样当敏感值截断。
 
 端点、响应字段、状态机与未验证项见 `references/lupi-async-api.md`。
+
+### 3c. Grok Imagine（grok2api，同步通道）
+
+自建 `https://grok.a18016.ccwu.cc`，**同步返回**，没有 task_id：
+
+```sh
+python3 scripts/grok_image.py models
+python3 scripts/grok_image.py gen --prompt "…" --model grok-imagine-image-2.0 --ratio 2:3 --n 1 --json
+python3 scripts/grok_image.py edit --prompt "…" --image-url https://…/v1/media/images/img_xxx --json
+```
+
+1. **先看 `/readyz` 的具体 component**：`grok_web` 带 Statsig 预热提示仍可用；`grok_console` 显示「无可用账号」时该 scope 模型不可用。`state: degraded` 本身不代表坏。
+2. 请求只收 JSON（multipart 415）；`aspect_ratio` 有白名单，`quality` 仅 `low|medium`，`resolution` 仅 `1k|2k`（Web 生成路径实测 `2k` **不改变尺寸**）。
+3. 实测像素：`1:1→960×960`、`3:2→1152×768`、`2:3→768×1152`（请求 `1024x1536` 会被缩到 `768×1152`）、`9:16→720×1280`。**lite 忽略比例**，只会出 `832×1248`，换来 3 秒出图。
+4. 编辑端点仅 JSON、`image.url` 必须是**公网可读**地址（`file_id` 不支持）；可直接用上一次生成的媒体 URL 回灌，实测可行；Web 编辑限 `n=1`。
+5. **媒体 URL 不带 key 也能打开**（实测 `noauth=200`）——拿到链接即可看图。交付前先下载到本地再内嵌，别把媒体 URL 贴到公开场合。
+6. 同步失败没有幂等键：超时/断流等于结果不确定，重发就是新任务，不自动重试。
 
 ### 4. 验证
 
