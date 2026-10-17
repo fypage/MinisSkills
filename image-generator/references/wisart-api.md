@@ -91,9 +91,9 @@ Recovery matching must use `created_at >= request_started_at` and exact `prompt/
 
 ## Display metadata
 
-Prefer actual saved image dimensions over requested resolution tier. 统一按 SKILL.md 的六行排列输出：
+Prefer actual saved image dimensions over requested resolution tier. 统一按 SKILL.md 的六行排列输出（围栏用 `yaml`，客户端才给复制按钮）：
 
-```md
+```yaml
 生图信息
 
 站点：智画创
