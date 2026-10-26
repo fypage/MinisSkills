@@ -186,32 +186,14 @@ def run(rule, base_url, subrules=None, binds=None):
       都能骗过朴素扫描（`replace(/[?&]$/,'')` 里的 `''` 就骗过一次）。
       改为把**整段规则原样**交给 node：用 new Function 逐句执行，并在
       `catch` 中回退到「把最后一行当表达式求值」，与 Rhino 取末值语义对齐。
+
+    ★ 2026-10-26 改：走常驻 node worker（js_worker.py）。此前每条规则都 spawn
+      一次 node，实测冷启动 203 ms；目录 1001 章逐条求值约需 200 秒，必然超时。
+      常驻后单条约 0.6 ms。worker 不可用时自动退回一次性调用。
     """
-    subrules = subrules or {}
-    body = rule
-    # ★ 2026-10-21 换用 js_eval.js：旧 driver 的 evalWithReturn 对三元/裸表达式
-    #   一律求值失败（所有 <js> 都返回空串），等于把「规则没过」伪装成
-    #   「规则写错」。js_eval.js 用「顶层级切点 + 语法预检 + with(scope)」实现
-    #   Rhino 末值语义，已用 4 组用例验证（三元、for 循环、java.ajax、正则）。
-    ev = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'js_eval.js')
-    # ★ 2026-10-25 修：subrules 必须随 cfg 写进 _rule.json。旧版只写 rule/binds，
-    #   js_eval.js 里 java.getString 恒返回 ''，于是「预置子规则」形同虚设——
-    #   依赖 getString 的分页/拼接类规则会被误判为不通过（实测：55kxs 分页自停）。
-    cfg = {'rule': body, 'binds': dict(binds or {}), 'subrules': dict(subrules)}
-    with open('/tmp/_rule.json', 'w') as f:
-        json.dump(cfg, f, ensure_ascii=False)
-    r = subprocess.run(['node', ev, '/tmp/_rule.json', base_url], capture_output=True, text=True, timeout=300)
-    if r.returncode != 0:
-        print('node stderr:', r.stderr[:400])
-        return None, []
-    try:
-        d = json.loads(r.stdout)
-    except Exception:
-        print('无法解析 node 输出:', r.stdout[:300])
-        return None, []
-    if d.get('err'):
-        print('JS 运行错误:', d['err'][:300])
-    return d.get('out'), d.get('log', [])
+    from js_worker import shared_worker
+    out, log = shared_worker().eval(rule, base_url, subrules, binds)
+    return out, log or []
 
 
 if __name__ == '__main__':

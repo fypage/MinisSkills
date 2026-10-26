@@ -95,6 +95,8 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 
 | 2026-10-26（v4.1.1） | **修复 `debug_source.py` 不接受数组形态**：Legado 标准导出是 `[{...}]`，脚本原来直接 `src.get()` → `AttributeError: 'list' object has no attribute 'get'`，界面上表现为「工具调用意外中断 / 卡住」。现支持单对象与数组双形态（数组取第 1 项，多项时打印警告），空数组与非法顶层给明确提示。另修 `utf-8` → `utf-8-sig`（带 BOM 的文件同样会崩）。**排查经验：工具连续报「意外中断」时，先看上一轮 tool result 的 traceback，往往是被中断掩盖的脚本异常。** | 解析器 64/64、分型 13、validator 14+28、lint 17、transport 全过；四种顶层形态（单对象/单元素数组/空数组/双元素数组）实跑验证 |
 
+| 2026-10-26（v4.2.0） | **修复 `@js` 逐条 spawn node 导致的超时**：此前每条 `@js` 规则都启动一次 node，实测冷启动 **203 ms**；目录 1001 章（`chapterUrl` 为 `@js`）约需 **200 秒**，表现为「工具调用卡住 / 意外中断」。① `js_eval.js` 抽出 `evaluate()` 并加 `module.exports`，`require.main` 判空使 CLI 用法不变 ② 新增 `js_worker.py`：常驻 node 经 stdin/stdout 按行收发 JSON，单条降到 **0.6 ms**（约 340×）③ `exec_js_rule_node.run()` 改走共享 worker，崩溃/无响应自动降级为一次性调用。实测：`sudugu.cc` 992 章目录 **6.9 秒**（原约 200 秒）。 | 解析器 64/64、分型 13、validator 14+28、lint 17、transport 全过；容错实测（杀进程后自动降级并恢复、语法错误不致命） |
+
 ## 五、已知限制
 
 - **同版本 JVM 引擎本机起不来**：PRoot/seccomp 禁止可执行内存页，

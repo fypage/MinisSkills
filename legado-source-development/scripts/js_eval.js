@@ -83,9 +83,10 @@ function evalRule(src, scope) {
   }
 }
 
-function main() {
-  const cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-  const baseUrl = process.argv[3] || '';
+// 2026-10-26：抽出 evaluate()，使本文件既能被 CLI 执行，也能被常驻 worker require。
+// 原因：目录 1001 章逐条 spawn node，单次冷启动 203 ms → 约 200 秒超时。
+function evaluate(rule, baseUrl, subrules, bindsIn) {
+  const cfg = { rule: rule, subrules: subrules || {}, binds: bindsIn || {} };
   const logs = [];
   const scope = {};
   const binds = cfg.binds || {};
@@ -111,10 +112,18 @@ function main() {
     const v = evalRule(scriptOf(cfg.rule), scope);
     out = v === undefined || v === null ? '' : String(v);
   } catch (e) {
-    process.stdout.write(JSON.stringify({ out: '', logs, err: String(e && e.message || e) }));
-    return;
+    return { out: '', log: logs, err: String(e && (e.message || e)) };
   }
-  process.stdout.write(JSON.stringify({ out, logs, err: '' }));
+  return { out: out, log: logs, err: '' };
 }
 
-main();
+function main() {
+  const cfg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const baseUrl = process.argv[3] || '';
+  const r = evaluate(cfg.rule, baseUrl, cfg.subrules, cfg.binds);
+  process.stdout.write(JSON.stringify({ out: r.out, logs: r.log, err: r.err }));
+}
+
+module.exports = { evaluate: evaluate };
+
+if (require.main === module) main();
