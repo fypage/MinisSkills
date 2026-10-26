@@ -62,10 +62,10 @@ python3 scripts/batch_render.py --plan generated-images/<slug>/plan.json \
 - 失败汇总退出码 1。
 
 **2026-10-27 真实出图实测**：
-- `gpt-image-2.5-flare`（orbitix）**不可用**：返回 `Invalid API key`，两次探测（含最简提示词）均失败，与提示词无关；
+- `gpt-image-2.5-flare`（orbitix）**可用**。此前报 `Invalid API key` 的真因是**余额耗尽**（$0.3755）：网关把 402 额度不足糊成了 401 兜底文案；签到补到 $17.46 后同一把 Key 立刻出图成功（998 KB PNG）。排查顺序应为**先看余额，充值后原样重试，最后才怀疑 Key**；
 - `gpt-image-2`（噜皮生图）**可用**：62 秒出图，请求 `1024x1024` 实出 `1254×1254`（复现既有记录），1.1 MB PNG；
 - 探路图主体占比实测 65.8%（`analyze_ref.py`），高于白底主图 35–40% 的目标区间，说明模型有放大主体的倾向，提示词需在占比上收紧；
-- 批量脚本默认模型已改为 `gpt-image-2` / `噜皮生图`。
+- 批量脚本默认模型为 `gpt-image-2` / `噜皮生图`（两条通道现均可用，orbitix 用 `--model gpt-image-2.5-flare --provider orbitix` 切换）。
 
 **仍未验证**：
 - 12 张整包的分批节奏与总耗时；

@@ -8,7 +8,7 @@
 |---|---|---|
 | **A 噜皮生图（App 供应商）** | **默认**。`gpt-image-2`，2026-10-27 实测可用，62 秒出 `1254×1254` | `image-generator/scripts/openminis_image.py` |
 | **B 噜皮异步** | 需要 task_id、断线续查、批量并发 | `image-generator/scripts/lupi_async.py` |
-| **C orbitix** | ⚠️ **当前不可用**：`gpt-image-2.5-flare` 返回 `Invalid API key`（2026-10-27 两次探测）。Key 修好后可切换 | 同上，`--model gpt-image-2.5-flare --provider orbitix` |
+| **C orbitix** | 可用。`gpt-image-2.5-flare`，2026-10-27 实测出图正常（998 KB PNG） | 同上，`--model gpt-image-2.5-flare --provider orbitix` |
 | **D grok2api 自建** | 免费、快（3 秒/张），但只有 1k、部分模型忽略比例 | `image-generator/scripts/grok_image.py` |
 | **E 无可用模型** | 停。只交提示词包 + 出图指引 | — |
 
@@ -77,6 +77,22 @@ python3 /var/minis/skills/image-generator/scripts/grok_image.py gen \
 
 不停摆：完整交出 Image Pack Plan + 全部提示词文件 + 目录结构，并给指引：
 - 配模型：[供应商设置](minis://settings/providers) / [模型组](minis://settings/model-groups)
+
+## 排障：先查余额，再查 Key
+
+★ **看到 `Invalid API key` 不要立刻断定 Key 失效。** 2026-10-27 实测：orbitix 账户余额只剩 `$0.3755` 时，`gpt-image-2.5-flare` 返回 `Invalid API key`；签到补到 `$17.46` 后，**同一把 Key、同一个模型**立刻出图成功。
+
+网关把「额度不足」的 402 糊成了 401 的兜底文案，而 `minis-model-use` 的诊断里 `http_status: null`、`error_code: unknown`，等于没留下任何可判定的证据。
+
+**排查顺序**（反了会白折腾）：
+
+1. 看账户余额够不够单张价（余额截图/后台，别先猜）
+2. 充值或签到后**原样重试一次**——一秒分出真假
+3. 才轮到 Key 轮换、模型白名单、实例错配
+
+同理适用于任何网关：错误文案是兜底时，唯一可信的是「改一个变量重试」的实测。
+
+---
 
 ## 批量脚本
 

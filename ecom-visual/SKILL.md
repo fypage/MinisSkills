@@ -232,7 +232,7 @@ AI 默认爱出正面 3/4，不显式指定就整套雷同。每张都要写角�
 
 优先用当前环境已有的图片模型通道。调用方式见 `references/render.md`。
 
-> ★ 2026-10-27 实测：`gpt-image-2.5-flare`（orbitix）返回 `Invalid API key`，两次探测均失败；可用通道为 `gpt-image-2`（噜皮生图）。批量脚本默认已改为该模型，orbitix 修好后再切回。
+> ★ 2026-10-27 实测：`gpt-image-2.5-flare`（orbitix）在**余额耗尽**时会返回 `Invalid API key`——这是网关把 402/额度不足糊成了 401 的兜底文案，**不是 Key 失效**。充值到账后同一把 Key 立刻恢复出图（998 KB PNG）。见 `references/render.md` 的排障条目。
 
 - 单张：提示词走 `--prompt`；长提示词写文件后传文件。
 - 多张：每张一个提示词文件，命名 `01-hero.txt`、`02-pain.txt`…，输出到 `generated-images/<产品slug>/`。
