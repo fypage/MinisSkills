@@ -93,6 +93,8 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 未修复：`xbfdc.net` 整站已无搜索入口（站点改版，建议放弃）。
 
 
+| 2026-10-26（v4.1.1） | **修复 `debug_source.py` 不接受数组形态**：Legado 标准导出是 `[{...}]`，脚本原来直接 `src.get()` → `AttributeError: 'list' object has no attribute 'get'`，界面上表现为「工具调用意外中断 / 卡住」。现支持单对象与数组双形态（数组取第 1 项，多项时打印警告），空数组与非法顶层给明确提示。另修 `utf-8` → `utf-8-sig`（带 BOM 的文件同样会崩）。**排查经验：工具连续报「意外中断」时，先看上一轮 tool result 的 traceback，往往是被中断掩盖的脚本异常。** | 解析器 64/64、分型 13、validator 14+28、lint 17、transport 全过；四种顶层形态（单对象/单元素数组/空数组/双元素数组）实跑验证 |
+
 ## 五、已知限制
 
 - **同版本 JVM 引擎本机起不来**：PRoot/seccomp 禁止可执行内存页，

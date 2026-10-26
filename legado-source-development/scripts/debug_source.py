@@ -1298,7 +1298,20 @@ def main():
     ap.add_argument('--page', default='1')
     a = ap.parse_args()
 
-    src = json.load(open(a.source, encoding='utf-8'))
+    src = json.load(open(a.source, encoding='utf-8-sig'))
+    # Legado 书源标准导出是数组 [{...}]，也允许单对象。两种形态都接受，
+    # 数组时取第 1 项（调试面板一次只针对一个源）。
+    if isinstance(src, list):
+        if not src:
+            print('✗ 文件是空数组，没有书源可调试')
+            return
+        if len(src) > 1:
+            print('⚠ 文件含 %d 个书源，只调试第 1 个：%s'
+                  % (len(src), src[0].get('bookSourceName')))
+        src = src[0]
+    if not isinstance(src, dict):
+        print('✗ 顶层不是对象或数组，无法识别为书源')
+        return
     set_site(src.get('bookSourceUrl', ''))
     set_header(src.get('header', ''))
     print('书源：%s' % src.get('bookSourceName'))
