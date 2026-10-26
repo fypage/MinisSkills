@@ -1,0 +1,114 @@
+{
+  "slug": "laundry-pods-pdp",
+  "reference_image": null,
+  "shots": [
+    {
+      "id": "01",
+      "use": "主图-首图卖点",
+      "ratio": "1:1",
+      "template": "01-hero-image",
+      "copy": "一颗一洗",
+      "file": "01-hero.png",
+      "prompt_file": "prompts/01-hero.txt"
+    },
+    {
+      "id": "02",
+      "use": "主图-机制功能",
+      "ratio": "1:1",
+      "template": "04-detail-macro",
+      "copy": "预配比",
+      "file": "02-mechanism.png",
+      "prompt_file": "prompts/02-mechanism.txt"
+    },
+    {
+      "id": "03",
+      "use": "主图-利益证明",
+      "ratio": "1:1",
+      "template": "11-infographic",
+      "copy": "省时省手",
+      "file": "03-benefit.png",
+      "prompt_file": "prompts/03-benefit.txt"
+    },
+    {
+      "id": "04",
+      "use": "主图-对比场景",
+      "ratio": "1:1",
+      "template": "09-before-after",
+      "copy": "告别倒液",
+      "file": "04-compare.png",
+      "prompt_file": "prompts/04-compare.txt"
+    },
+    {
+      "id": "05",
+      "use": "主图-优惠保障",
+      "ratio": "1:1",
+      "template": "05-poster-banner",
+      "copy": "30天无忧",
+      "file": "05-offer.png",
+      "prompt_file": "prompts/05-offer.txt"
+    },
+    {
+      "id": "06",
+      "use": "详情-首屏承接",
+      "ratio": "2:3",
+      "template": "11-infographic",
+      "copy": "为忙碌家庭",
+      "file": "06-pdp-first.png",
+      "prompt_file": "prompts/06-pdp-first.txt"
+    },
+    {
+      "id": "07",
+      "use": "详情-痛点放大",
+      "ratio": "2:3",
+      "template": "11-infographic",
+      "copy": "脏手与残液",
+      "file": "07-pdp-pain.png",
+      "prompt_file": "prompts/07-pdp-pain.txt"
+    },
+    {
+      "id": "08",
+      "use": "详情-机制解释",
+      "ratio": "2:3",
+      "template": "17-exploded-view",
+      "copy": "遇水即溶",
+      "file": "08-pdp-mechanism.png",
+      "prompt_file": "prompts/08-pdp-mechanism.txt"
+    },
+    {
+      "id": "09",
+      "use": "详情-核心利益",
+      "ratio": "2:3",
+      "template": "11-infographic",
+      "copy": "四项核心利益",
+      "file": "09-pdp-benefits.png",
+      "prompt_file": "prompts/09-pdp-benefits.txt"
+    },
+    {
+      "id": "10",
+      "use": "详情-使用步骤",
+      "ratio": "2:3",
+      "template": "13-size-spec",
+      "copy": "三步完成",
+      "file": "10-pdp-steps.png",
+      "prompt_file": "prompts/10-pdp-steps.txt"
+    },
+    {
+      "id": "11",
+      "use": "详情-场景覆盖",
+      "ratio": "2:3",
+      "template": "02-lifestyle-scene",
+      "copy": "宿舍/租房/家庭",
+      "file": "11-pdp-scenes.png",
+      "prompt_file": "prompts/11-pdp-scenes.txt"
+    },
+    {
+      "id": "12",
+      "use": "详情-信任与CTA",
+      "ratio": "2:3",
+      "template": "10-packaging",
+      "copy": "30天保障",
+      "file": "12-pdp-cta.png",
+      "prompt_file": "prompts/12-pdp-cta.txt"
+    }
+  ]
+}
