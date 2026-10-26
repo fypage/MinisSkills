@@ -108,6 +108,10 @@ def absolutize(u, base=None):
     ★ curl 不认识「/book/x/」这种相对路径 —— 会直接返回 exit 6，
       curl -w 打出的 %{http_code} 就是 000、len=0。
       这现象极像「站点挂了」，其实是我们没拼 URL（实测踩过）。
+
+    ★ 2026-10-26 修：以 `/` 开头的路径必须补到**域名根**，不能直接拼在
+      当前页地址后面。旧实现在正文分页场景把 `/1737/x_2.html` 拼成了
+      `…/1737/1450832.html/1737/x_2.html` → 404 空页，看着像「正文取值为空」。
     """
     u = str(u or '').strip()
     if not u or u.startswith(('http://', 'https://')):
@@ -115,7 +119,16 @@ def absolutize(u, base=None):
     b = (base or SITE or '').rstrip('/')
     if not b:
         return u
-    return b + '/' + u.lstrip('/')
+    if u.startswith('//'):          # 协议相对
+        return 'https:' + u
+    if u.startswith('/'):
+        # 取基址的 scheme://host 部分
+        m = re.match(r'^(https?://[^/]+)', b)
+        return (m.group(1) if m else b) + u
+    # 相对当前目录
+    if b.endswith('/'):
+        return b + u
+    return b.rsplit('/', 1)[0] + '/' + u
 
 
 def pick_charset(opts, content_type, raw):

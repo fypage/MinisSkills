@@ -344,8 +344,55 @@ def _pseudo_anchor(base):
     return ""
 
 
+EQ_RE = re.compile(r":eq\(\s*(-?\d+)\s*\)")
+
+
+def _strip_eq(selector):
+    """剥离 :eq(n) 并返回 (纯选择器, [n,...])。
+
+    ★ 2026-10-26：`:eq(n)` 是目标客户端的自有扩展（真机在用，如 55kxs、素书卷），
+      但 cssselect2 不认，会抛 Unknown pseudo-class —— 把合法规则误判成源缺陷。
+      语义与调试脚本一致：对**该层级**的候选集取第 n 个（支持负数，-1 为末项）。
+      多个 :eq 依次作用（自左向右）。
+    """
+    idxs = [int(m.group(1)) for m in EQ_RE.finditer(selector or "")]
+    if not idxs:
+        return selector, []
+    return EQ_RE.sub("", selector), idxs
+
+
+def _apply_eq(elements, idxs):
+    out = list(elements)
+    for n in idxs:
+        if not out:
+            return []
+        i = n if n >= 0 else len(out) + n
+        out = [out[i]] if 0 <= i < len(out) else []
+    return out
+
+
 def _select_elements(html, selector):
     """CSS 选择 → 元素列表。优先 lxml+cssselect2，退化到内置受限选择器。"""
+    selector, eq_idxs = _strip_eq(selector)
+    if eq_idxs:
+        base_sel = selector.strip() or "*"
+        try:
+            from lxml import html as lhtml
+            from cssselect2 import ElementWrapper, Matcher, compile_selector_list
+            root = lhtml.fromstring(html)
+            wrapper_root = ElementWrapper.from_html_root(root)
+            matcher = Matcher()
+            for sel_obj in compile_selector_list(base_sel):
+                matcher.add_selector(sel_obj, None)
+            picked = []
+            for w in wrapper_root.iter_subtree():
+                if bool(matcher.match(w)) and w.etree_element is not None:
+                    picked.append(w.etree_element)
+            return _apply_eq(picked, eq_idxs)
+        except ImportError:
+            pass  # 交给下面的通用路径
+        except Exception:
+            pass
     pseudo = _apply_jsoup_pseudos(html, selector)
     if pseudo is not None:
         return pseudo
@@ -644,9 +691,22 @@ def eval_field(rule, ctx_html, base=""):
     vals = eval_rule(rule, ctx_html, base)
     if not vals:
         return ""
+    # ★ 2026-10-26 修：原写法 `isinstance(rule,str) and rule.endswith("@href") or "Url" in rule`
+    #   因 and/or 优先级，只要有 "...Url" 就无条件 urljoin —— 把 JS 返回的绝对地址
+    #   又拼了一次基址（实测 tocUrl="<js>baseUrl</js>" 变成 `…/1737/{{baseUrl}}`）。
+    #   且旧实现在拼接前就用 \n 合并了多值，拼出来的是一串地址。
+    #   正确做法：逐个值补全相对地址，再按 Legado 语义用 \n 连接。
+    is_url_rule = isinstance(rule, str) and (
+        rule.strip().endswith("@href") or rule.strip().endswith("@src")
+        or rule.strip().endswith("@data-href"))
+    if is_url_rule and base:
+        fixed = []
+        for v in vals:
+            if v and not v.startswith(("http://", "https://", "//")):
+                v = urljoin(base, v)
+            fixed.append(v)
+        vals = fixed
     v = vals[0] if len(vals) == 1 else "\n".join(vals)
-    if isinstance(rule, str) and rule.strip().endswith("@href") or "Url" in rule:
-        v = urljoin(base, v) if base else v
     return v
 
 

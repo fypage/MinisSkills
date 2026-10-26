@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -143,3 +144,8 @@ def close_shared():
     if _shared is not None:
         _shared.close()
         _shared = None
+
+
+# ★ 2026-10-26：进程退出时务必回收常驻 node，否则反复调用会累积孤儿进程，
+#   最终被 PRoot 以 SIGKILL 收拾（表现为 "proot info: vpid 1: terminated with signal 9"）。
+atexit.register(close_shared)

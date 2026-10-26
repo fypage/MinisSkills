@@ -97,6 +97,8 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 
 | 2026-10-26（v4.2.0） | **修复 `@js` 逐条 spawn node 导致的超时**：此前每条 `@js` 规则都启动一次 node，实测冷启动 **203 ms**；目录 1001 章（`chapterUrl` 为 `@js`）约需 **200 秒**，表现为「工具调用卡住 / 意外中断」。① `js_eval.js` 抽出 `evaluate()` 并加 `module.exports`，`require.main` 判空使 CLI 用法不变 ② 新增 `js_worker.py`：常驻 node 经 stdin/stdout 按行收发 JSON，单条降到 **0.6 ms**（约 340×）③ `exec_js_rule_node.run()` 改走共享 worker，崩溃/无响应自动降级为一次性调用。实测：`sudugu.cc` 992 章目录 **6.9 秒**（原约 200 秒）。 | 解析器 64/64、分型 13、validator 14+28、lint 17、transport 全过；容错实测（杀进程后自动降级并恢复、语法错误不致命） |
 
+| 2026-10-26（v4.3.0） | **接手 `sudugu.cc` 时暴露的三处脚本缺陷**：① `debug_source.absolutize()` 把以 `/` 开头的路径拼在当前页地址后（`…/1450832.html` + `/1737/x_2.html` → `…/1450832.html/1737/x_2.html`）→ 正文分页第 2 页起全空，看着像「正文取不到」。改为 `/` 路径补到域名根、`//` 补协议、其余按目录相对 ② `rule_exec.eval_field()` 里 `A and B or "Url" in rule` 的 and/or 优先级错误，只要字段名含 Url 就无条件 urljoin，把 JS 返回的绝对地址二次拼接（`tocUrl` 变 `…/1737/{{baseUrl}}`）；且旧实现先把多值 `\n` 合并再拼接，拼出一串地址。改为逐值补全后再连接 ③ `rule_exec` 不支持 `:eq(n)`（真机在用），把合法规则报成 `Unknown pseudo-class` → 新增 `_strip_eq` / `_apply_eq`，与调试脚本语义一致。另修 `js_worker.py` 加 `atexit` 回收常驻 node——否则反复调用累积孤儿进程，最终被 PRoot 以 SIGKILL 收拾（界面表现为 `proot info: vpid 1: terminated with signal 9`）。新增 `test_rule_exec_eq.py`（8 项） | 解析器 64/64、分型 13、validator 14+28、lint 17、transport、eq 8 全过；`sudugu.cc` 门禁 ISSUES 0（search 27 / explore 10 / info 1 / content 1） |
+
 ## 五、已知限制
 
 - **同版本 JVM 引擎本机起不来**：PRoot/seccomp 禁止可执行内存页，
