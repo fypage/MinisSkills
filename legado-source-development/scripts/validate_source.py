@@ -81,6 +81,31 @@ def check_rule_text(value,where,out,target):
   add(out,"error",where,"POST/GET 请求选项应写在 URL 后的 JSON 选项（method/body/headers），不支持 ;post= 或 ;get=")
  if re.search(r":\s*(?:has|visible|hidden)\s*\(",value) and not where.endswith(("nextContentUrl","nextTocUrl")):
   add(out,"error",where,"疑似 jQuery 扩展伪类（:has/:visible/:hidden）。注意目标 MD3 的 Jsoup 基于 CSS 引擎，:contains() 类文本匹配是否生效须真机核实；标准 CSS 更稳妥")
+ # ★ Rhino 1.8.1 无浏览器 API：沙箱 node 能跑不等于真机能跑（2026-10-26 真机实测）
+ if value.lstrip().startswith("@js:") or "<js>" in value:
+  # 剔除字符串字面量与正则字面量，避免把页面源码里的 "atob(...)" 误判为调用
+  _scan = re.sub(r"'(?:[^'\\]|\\.)*'", "''", value)
+  _scan = re.sub(r'"(?:[^"\\]|\\.)*"', '""', _scan)
+  _scan = re.sub(r"/(?:[^/\\\n]|\\.)+/[gimsuy]*", "//", _scan)
+  _rhino_forbidden = {
+   "atob": "java.base64Decode",
+   "btoa": "java.base64Encode",
+   "fetch": "java.ajax",
+   "XMLHttpRequest": "java.ajax",
+   "TextEncoder": "手写字节转换或 java.strToBytes",
+   "TextDecoder": "手写字节转换",
+   "setTimeout": "（Rhino 宿主未注入，需改同步写法）",
+   "setInterval": "（Rhino 宿主未注入，需改同步写法）",
+  }
+  for _fn, _alt in _rhino_forbidden.items():
+   if re.search(r"(?<![\w.])" + _fn + r"\s*\(", _scan):
+    add(out,"error",where,f"@js 使用 {_fn}() —— Rhino 1.8.1 无此 API，真机将抛 ReferenceError；改用 {_alt}")
+  if re.search(r"(?<![\w.])(document|window|navigator|location)\s*\.", _scan):
+   add(out,"error",where,"@js 引用浏览器 DOM 对象（document/window/navigator/location）—— Rhino 无此环境")
+  if re.search(r"\bPromise\s*[.(]|\basync\s+(?:function|\()|\bawait\s+", _scan):
+   add(out,"error",where,"@js 使用 Promise/async/await —— Rhino 1.8.1 不支持，改同步写法")
+  if re.search(r"=>|\blet\s+|\bconst\s+|`", _scan):
+   add(out,"warning",where,"@js 出现箭头函数/let/const/模板字符串（ES6）—— Rhino 1.8.1 不保证支持，建议按 ES5 写")
  # 这里只做保守文本检查，不解析或执行 JS；动态规则交由目标引擎验证。
  selector=plain.split("@js:",1)[0].split("##",1)[0].strip()
  # @css 多 action 链：Legado 按「最后一个 @」切分取值，`@css:sel@text@js:...`

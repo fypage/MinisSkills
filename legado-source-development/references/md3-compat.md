@@ -101,6 +101,34 @@ EOF
 
 制作 MD3 源优先 CSS/Default；必须使用 XPath 时，先用 `/var/minis/shared/legado/sandbox/EngineProbe.java` 的同版本引擎验证。
 
+## ★@js 宿主 API 边界（Rhino 1.8.1，2026-10-26 真机实测）
+
+**沙箱 node 能跑 ≠ 真机能跑。** 本机 `js_eval.js` 走 node（V8，完整 ES + 浏览器子集），
+真机走 Rhino 1.8.1（ES5，**无浏览器 API**）。以下函数在沙箱里有、在 Rhino 里没有，
+一旦使用会抛 `ReferenceError: "xxx" 未定义`，整条链路直接崩：
+
+| 不可用（浏览器/DOM 专属） | 替代写法 |
+|---|---|
+| `atob(s)` / `btoa(s)` | `java.base64Decode(s)` / `java.base64Encode(s)` |
+| `fetch` / `XMLHttpRequest` | `java.ajax(url)` / `java.ajaxAll(urls)` |
+| `Promise` / `async` / `await` | 同步写法；`java.ajax` 本身是同步的 |
+| `document` / `window` / `location` / `navigator` | 用 `baseUrl`、`java.getString(rule)` |
+| `setTimeout` / `setInterval` | 无（Rhino 宿主未注入） |
+| `TextEncoder` / `TextDecoder` | 手写字节转换或 `java.strToBytes` |
+| `crypto.subtle` / `CryptoJS` 全局名 | `java.hexDecodeToString` 等宿主方法，或自带实现 |
+
+**也在 ES5 之外、Rhino 不保证可用**：`Array.prototype.includes`、`Object.assign`、
+箭头函数、模板字符串、`let`/`const`、解构、可选链 `?.`。写 `@js` 一律按 ES5 写。
+
+**本技能已确认可用的宿主对象**：`java.ajax`、`java.ajaxAll`、`java.getString`、
+`java.getElement`、`java.base64Decode`、`java.base64Encode`、`java.hexDecode`、
+`java.encodeURI`、`java.put`/`java.get`、`java.log`；变量 `result`、`src`、`baseUrl`、
+`book`、`chapter`、`title`、`nextChapterUrl`。
+
+**★纪律：写 `@js` 前先自问「这个函数 Rhino 1.8.1 有没有」。** 沙箱测试通过只证明逻辑对，
+不证明能在真机执行；涉及 base64/网络/DOM 时，必须按上表改用宿主 API。
+
+
 ## 真机调试
 
 MD3 Compose 调试页可能按模块自动处理 `++`/`--`。记录目标 APK 版本、完整输入、完整日志和输出语义。字段能反序列化、请求能成功、列表有数量，分别是不同验证阶段。

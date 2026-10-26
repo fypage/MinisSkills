@@ -99,6 +99,8 @@ python3 /var/minis/shared/legado/tools/audit_skill_push.py
 
 | 2026-10-26（v4.3.0） | **接手 `sudugu.cc` 时暴露的三处脚本缺陷**：① `debug_source.absolutize()` 把以 `/` 开头的路径拼在当前页地址后（`…/1450832.html` + `/1737/x_2.html` → `…/1450832.html/1737/x_2.html`）→ 正文分页第 2 页起全空，看着像「正文取不到」。改为 `/` 路径补到域名根、`//` 补协议、其余按目录相对 ② `rule_exec.eval_field()` 里 `A and B or "Url" in rule` 的 and/or 优先级错误，只要字段名含 Url 就无条件 urljoin，把 JS 返回的绝对地址二次拼接（`tocUrl` 变 `…/1737/{{baseUrl}}`）；且旧实现先把多值 `\n` 合并再拼接，拼出一串地址。改为逐值补全后再连接 ③ `rule_exec` 不支持 `:eq(n)`（真机在用），把合法规则报成 `Unknown pseudo-class` → 新增 `_strip_eq` / `_apply_eq`，与调试脚本语义一致。另修 `js_worker.py` 加 `atexit` 回收常驻 node——否则反复调用累积孤儿进程，最终被 PRoot 以 SIGKILL 收拾（界面表现为 `proot info: vpid 1: terminated with signal 9`）。新增 `test_rule_exec_eq.py`（8 项） | 解析器 64/64、分型 13、validator 14+28、lint 17、transport、eq 8 全过；`sudugu.cc` 门禁 ISSUES 0（search 27 / explore 10 / info 1 / content 1） |
 
+| 2026-10-26（v4.3.1） | **真机暴露 Rhino API 缺失**：`sudugu` 的 `chapterUrl` 用了 `atob()`（浏览器 API），沙箱 node 有、Rhino 1.8.1 没有 → 真机抛 `ReferenceError: "atob" 未定义`，整个目录加载失败。改用 `java.base64Decode`，并加手写 base64 兜底。`md3-compat.md` 新增「@js 宿主 API 边界」表（atob/btoa/fetch/Promise/document/setTimeout 全部不可用及替代写法）；`validate_source.py` 新增对应静态检查（含字符串/正则剔除，避免把页面源码里的 `atob(` 误判为调用）——上线即抓出 `bachashuku` 同类问题。另修 `sudugu` 正文：`@html` 保留 `<br/>` 导致渲染错乱，改 `@textNodes` 保留段落换行。 | lint 全绿；30 份源静态零错误；`sudugu` 三章正文抽检无 `<br>`、判定通过 |
+
 ## 五、已知限制
 
 - **同版本 JVM 引擎本机起不来**：PRoot/seccomp 禁止可执行内存页，

@@ -1,7 +1,7 @@
 ---
 name: legado-source-development
 description: 开发、修复、迁移、审计和测试 Legado（阅读3.0）书源与 RSS 订阅源，兼容 HapeLee/legado-with-MD3。处理 Default/CSS/JSONPath/XPath/JS/正则、搜索/发现/详情/目录/正文、分页、URL 请求、Cookie/WebView、导入 JSON、调试日志与 MD3 扩展。触发词：Legado、阅读3.0、MD3阅读、书源、订阅源、RSS源、ruleSearch、ruleToc、ruleContent、ruleArticles、sourceUrl。
-version: 4.3.0
+version: 4.3.1
 ---
 
 # Legado / MD3 规则开发
