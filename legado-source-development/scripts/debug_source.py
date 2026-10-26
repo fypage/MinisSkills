@@ -118,11 +118,29 @@ def absolutize(u, base=None):
     return b + '/' + u.lstrip('/')
 
 
+def pick_charset(opts, content_type, raw):
+    """响应解码字符集：URL 选项 charset → 响应头 → HTML meta → utf-8。
+
+    ★ 真机 Legado 走 NetworkUtils.getCharset(contentType, bytes)，GBK 站若这里
+      硬按 utf-8 解码，中文全成替换字符 —— 现象是「选择器全空/乱码」，
+      极易被误判成规则写错。实测 wap.xbqg87.com（charset=gbk）即如此。
+    """
+    enc = (opts or {}).get('charset')
+    if enc:
+        return str(enc)
+    m = re.search(r'charset\s*=\s*["\']?([\w-]+)', content_type or '', re.I)
+    if m:
+        return m.group(1)
+    m = re.search(rb'charset\s*=\s*["\']?([\w-]+)', raw[:4096], re.I)
+    if m:
+        return m.group(1).decode('latin-1')
+    return 'utf-8'
+
 def get(url, ref=None):
     url, opts = split_url_options(url)
     url = absolutize(url, opts.get('_base') or SITE)
     cmd = ['curl', '-s', '-L', '--max-time', '30',
-           '-w', '\n__CODE__%{http_code}']
+           '-w', '\n__CODE__%{http_code}__CT__%{content_type}']
     # ★ 书源 header 里若指定了 User-Agent，就用它；否则退回默认 UA。
     #   真机 Legado 会带 header，脚本不带会得出「规则错」的假结论。
     merged = dict(SRC_HEADER)
@@ -143,12 +161,19 @@ def get(url, ref=None):
             cmd += ['--data-raw', str(body)]
     cmd.append(url)
     r = subprocess.run(cmd, capture_output=True)
-    body = r.stdout.decode('utf-8', 'replace')
-    code = ''
-    m = re.search(r'\n__CODE__(\d+)$', body)
+    raw = r.stdout
+    code, ctype = '', ''
+    # 尾部标记是 ASCII，先在 bytes 上切掉，避免编码不对时正则失配
+    m = re.search(rb'\n__CODE__(\d+)__CT__([^\n]*)$', raw)
     if m:
-        code = m.group(1)
-        body = body[:m.start()]
+        code = m.group(1).decode()
+        ctype = m.group(2).decode('latin-1')
+        raw = raw[:m.start()]
+    enc = pick_charset(opts, ctype, raw)
+    try:
+        body = raw.decode(enc, 'replace')
+    except LookupError:
+        body = raw.decode('utf-8', 'replace')
     return body, code
 
 
@@ -305,6 +330,10 @@ def css(html, sel, attr=None):
             if seg.strip():
                 out.append(seg.strip())
         return out
+    if attr == 'html':
+        # ★ 真机语义：`@html` 取元素的 outerHTML（含自身标签），正文净化阶段
+        #   再把 <br>/<p> 还原为换行。旧版走 e.get('html') 恒 None → 正文恒空。
+        return [str(e) for e in els]
     if attr:
         return [e.get(attr) for e in els]
     return [e.get_text(strip=True) for e in els]
@@ -433,7 +462,22 @@ def apply_regex(value, regex):
     if not regex:
         return value
     pat, _, rep = regex.partition('##')
-    rep = re.sub(r'\$\{?(\w+)\}?', r'\\g<\1>', rep)
+    # ★ 2026-10-25 修（两处）：
+    #   1) 原写法 `re.sub(r'\$\{?(\w+)\}?', r'\\g<\1>', rep)` 产出的替换串是
+    #      「反斜杠 + \g<1>」，re.error 被下面的 except 吞掉后**原样返回整串原文**。
+    #      凡带捕获组的规则（kind/author 这类 `##^(.*)##$1##`）都取不到值，规则却看着没错。
+    #      改为手动拼 `\g<n>`，并**显式检查是否有捕获组**——没有组时绝不用含 `\g` 的替换串。
+    #   2) `##正则##$1`（末尾不带第二个 `##`）在 Legado 里是合法等价写法；
+    #      旧逻辑把 `$1` 也当成正则的一部分 → 变成「用空串替换」。
+    m2 = re.search(r'##(\$\{?(\d+|[A-Za-z_])+\}?.*)$', pat)
+    if m2:
+        pat, rep = pat[:m2.start()], m2.group(1)
+    if pat.count('(') and not rep:
+        rep = ''
+    elif pat.count('(') and rep:
+        rep = re.sub(r'\$\{?(\w+)\}?', lambda m: '\\' + 'g<' + m.group(1) + '>', rep)
+    else:
+        rep = re.sub(r'\$', '', rep)
     try:
         return re.sub(pat, rep, value)
     except re.error:
@@ -530,7 +574,14 @@ def node_value(node, rule):
         els = apply_eq_pseudo(els, ops)
     if not els:
         return ''
-    v = els[0].get_text(strip=True) if attr == 'text' else els[0].get(attr)
+    # ★ `@html` 不是属性：旧版走 els[0].get('html') 恒得 None → 正文页签永远
+    #   「取值长度=0」，与「正文规则写错」长得一模一样（实测 xbqg87 即此坑）。
+    if attr == 'html':
+        v = str(els[0])
+    elif attr == 'text':
+        v = els[0].get_text(strip=True)
+    else:
+        v = els[0].get(attr)
     if v is None:
         v = ''
     if isinstance(v, list):
@@ -665,6 +716,57 @@ def title(t):
     print('\n' + '-' * 64)
     print('【%s】' % t)
     print('-' * 64)
+
+# —— 失败分型（2026-10-26 借自 Narylr350/book-source-creator-skill 的 errorCode 思路）
+# 目的：把「取不到东西」拆成可定位的几类，避免一律报「规则写错了」。
+# 不改任何求值逻辑，只补诊断输出；HARNESS 项表示本脚本能力边界，不是源的缺陷。
+def code_of(phase, code, failed_field=None, detail=''):
+    tag = '%s.%s' % (phase, code)
+    msg = '  ✗ [%s]' % tag
+    if failed_field:
+        msg += ' 字段 %s' % failed_field
+    if detail:
+        msg += ' —— %s' % detail
+    print(msg)
+    return tag
+
+def classify_container(phase, rule, items):
+    """容器级失败分型：区分「没匹配」与「匹配了但 0 条」。"""
+    if items:
+        return None
+    if rule_kind(rule) in ('xpath', 'js') or '<js>' in str(rule):
+        return code_of(phase, 'HARNESS_UNSUPPORTED', None,
+                       '该容器规则形态本脚本无法求值（xpath/@js），真机由 Legado 解析；本项记「未评估」')
+    return code_of(phase, 'SELECTOR_EMPTY', None,
+                   '容器在本次响应上匹配 0 个节点；先确认响应是否为目标页（bodyPreview/长度）')
+
+def classify_content(s, code=None):
+    """正文分型：把「非正文」落到具体错误码。"""
+    try:
+        code_int = int(code) if code is not None and str(code).strip().isdigit() else None
+    except (TypeError, ValueError):
+        code_int = None
+    if not s:
+        return code_of('content', 'CONTENT_EMPTY', 'ruleContent.content', '规则取值为空')
+    if code_int == 404:
+        return code_of('content', 'HTTP_BLOCKED', None, 'HTTP 404，请求路径不存在')
+    if code_int and code_int >= 400:
+        return code_of('content', 'HTTP_BLOCKED', None, 'HTTP %s' % code_int)
+    low = str(s)
+    if 'Just a moment' in low or 'Attention Required' in low:
+        return code_of('content', 'CONTENT_IS_CAPTCHA_PAGE', None, '响应是 Cloudflare 人机验证页')
+    if re.search(r'(请登录|登录后|扫码登录|sign in|log in)', low[:2000], re.I):
+        return code_of('content', 'CONTENT_IS_LOGIN_PAGE', None, '响应像登录页，需 Cookie/登录态')
+    if re.search(r'(VIP|会员|订阅|付费|购买本章)', low[:2000]) and len(low) < 800:
+        return code_of('content', 'CONTENT_IS_VIP_LOCK_PAGE', None, '响应是付费/会员提示页，只能记 degraded')
+    zh = len(re.findall(r'[\u4e00-\u9fff]', low))
+    if len(low) < 100:
+        return code_of('content', 'CONTENT_TOO_SHORT', 'ruleContent.content',
+                       '仅 %d 字符，低于 100 字符门槛' % len(low))
+    if zh < 20 and '<script' in low[:4000]:
+        return code_of('content', 'CONTENT_IS_CSR_SHELL', 'ruleContent.content',
+                       '中文极少且含脚本，疑似前端渲染空壳，需 webView/webJs')
+    return None
 
 
 # 反爬站常在错误请求上返回「广告页 / 空壳页」而非错误码：
@@ -884,7 +986,9 @@ def expand_host_vars(u, base='', item=None):
     """
     if not u:
         return u
-    u = u.replace('{{baseUrl}}', (base or SITE or '').rstrip('/'))
+    # ★ 不要 rstrip('/')：真机注入的 baseUrl 是 bookUrl 原文，`/5/5518/` 这类
+    #   以斜杠结尾的书籍页被剥成 `/5/5518` 会 404，看着像「目录规则写错」。
+    u = u.replace('{{baseUrl}}', (base or SITE or ''))
     u = u.replace('{{bookUrl}}', base or '')
     # ★ {{$.xxx}} —— 从「当前条目」的 JSON 取值插值（如 bookUrl: /book/{{$.id}}.html）
     if '{{$.' in u and item is not None:
@@ -993,7 +1097,7 @@ def tab_info(src, book, url):
     print('  响应 HTTP %s  len=%d' % (code, len(html)))
     bi = src.get('ruleBookInfo', {})
     subr = {}
-    m = re.search(r'java\.getString\("([^"]+)"\)', bi.get('tocUrl', '') or '')
+    m = re.search(r'java\.getString\("((?:[^"\\]|\\.)+)"\)', bi.get('tocUrl', '') or '')
     if m:
         sr = m.group(1)
         subr[sr] = eval_field(sr, html, bu)
@@ -1050,7 +1154,7 @@ def tab_toc(src, book, url):
                   '以站点根请求（目录规则应基于书籍页，建议显式给 --url）')
     bh, _ = get(bu)
     subr = {}
-    m2 = re.search(r'java\.getString\("([^"]+)"\)', bi.get('tocUrl', '') or '')
+    m2 = re.search(r'java\.getString\("((?:[^"\\]|\\.)+)"\)', bi.get('tocUrl', '') or '')
     if m2:
         subr[m2.group(1)] = eval_field(m2.group(1), bh, bu)
     # ★ {{baseUrl}} 在 tocUrl 里指「本书详情页地址」；须先展开，否则会被
@@ -1103,6 +1207,13 @@ def tab_toc(src, book, url):
         urls.append(str(_u or '').strip())
     print('  章节 %d 条' % len(names))
     if not names:
+        # ★ 分型：容器有节点但章节名全空 ≠ 容器没匹配（此前两者都只报一句“未取到章节”）
+        if _els2:
+            code_of('toc', 'TOC_EMPTY', 'ruleToc.chapterName',
+                    '容器命中 %d 个节点但章节名全空；先查 chapterName 是否带 @text 取值' % len(_els2))
+        else:
+            code_of('toc', 'TOC_SELECTOR_EMPTY', 'ruleToc.chapterList',
+                    '容器在本页匹配 0 个节点')
         print('  ✗ 未取到章节。请核 chapterList 选择器是否命中本页：%r' % cl)
         return
     print('      首: %s' % names[0][:34])
@@ -1153,6 +1264,8 @@ def tab_content(src, url):
         s = str(out or '')
         ok, why = is_real_content(s)
         print('  结果长度=%d  判定=%s' % (len(s), ('✓ 正文（%s）' % why) if ok else '✗ ' + why))
+        if not ok:
+            classify_content(s)
         paras = [p for p in s.split('\n') if p.strip()]
         print('  段数=%d' % len(paras))
         if paras:
@@ -1167,6 +1280,10 @@ def tab_content(src, url):
         print('  响应 HTTP %s len=%d' % (code, len(html)))
         v = eval_field(rc, html, cu)
         print('  规则取值长度=%d' % len(str(v)))
+        _ok, _why = is_real_content(str(v))
+        if not _ok:
+            print('  判定=✗ %s' % _why)
+            classify_content(str(v), code)
 
 
 def main():

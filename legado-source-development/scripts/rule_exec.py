@@ -120,6 +120,12 @@ CSS_ATTR_RE = re.compile(r"^(?:(?P<sel>.*?)@)?(?P<attr>[A-Za-z][\w:-]*)$")
 
 MATCHESOWN_RE = re.compile(r":matchesOwn\(([^)]*)\)")
 MATCHESTEXT_RE = re.compile(r":matches\((?!Own)([^)]*)\)")
+# ★ Jsoup 1.16.2 原生支持 `:contains(text)`（QueryParser 里有 "contains" 分支，
+#   Evaluator.ContainsText，作用于元素**全部后代文本**）；cssselect2 不认它。
+#   实测：不归一化时 `p:contains(作者)` 在参考执行器抛
+#   SelectorError: ('Unknown pseudo-class', 'contains')，而该规则在真机合法。
+#   这里转成等价的 :matches(转义后的字面量) 复用同一套链路语义。
+CONTAINS_RE = re.compile(r":contains(Own)?\(")
 
 
 def _matches_simple(el, selector):
@@ -151,6 +157,34 @@ def _matches_simple(el, selector):
     return True
 
 
+def _normalize_contains(selector):
+    """`:contains(x)` / `:containsOwn(x)` → `:matches(转义字面量)`。
+
+    只处理**括号配平**的那一处（x 内若含括号则原样保留，交给引擎报错），
+    避免把 `:not(:contains(a))` 这类嵌套拆坏。
+    """
+    s = selector or ""
+    m = CONTAINS_RE.search(s)
+    if not m:
+        return s
+    start = m.end()          # 左括号之后
+    depth, i = 1, start
+    while i < len(s):
+        if s[i] == "(":
+            depth += 1
+        elif s[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        return s             # 括号不配平，交回原引擎处理
+    literal = s[start:i]
+    escaped = re.sub(r'([.^$*+?\[\]{}|\\])', r"\\\1", literal)
+    head = "" if m.group(1) else ""      # containsOwn 暂按 contains 处理（后代文本）
+    return s[:m.start()] + ":matches(" + escaped + ")" + s[i + 1:]
+
+
 def _apply_jsoup_pseudos(html, selector):
     """把 Jsoup 伪类 :matchesOwn() / :matches() 落到可执行形式。
 
@@ -164,6 +198,7 @@ def _apply_jsoup_pseudos(html, selector):
     对 `<a>下一页 <i/></a>` 这类混合内容，ownText 取后代全部文本即可。
     """
     from lxml import html as lhtml
+    selector = _normalize_contains(selector)
     own = MATCHESOWN_RE.search(selector)
     anyt = MATCHESTEXT_RE.search(selector)
     if own:
@@ -415,6 +450,15 @@ def default_values(html, payload):
     out = []
     for seg, conn in segments:
         seg = seg.strip()
+        if not seg:
+            continue
+        if seg.startswith("{{") and seg.endswith("}}") and "@" not in seg:
+            # ★ Legado 语义：Default 规则里不含 @ 时返回规则**原文**
+            #   （AnalyzeRule.evalRule → 无 @ 即取字符串本身，宿主变量已在
+            #   上游展开）。`tocUrl: {{baseUrl}}` 就是靠这条生效的。
+            #   旧版一律抛「缺少 @取值」→ 把合法写法报成源的缺陷。
+            out.append(seg)
+            continue
         at = seg.rfind("@")
         if at < 0:
             raise SelectorError(f"Default 规则缺少 @取值: {seg}")

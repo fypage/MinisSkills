@@ -1,7 +1,7 @@
 ---
 name: legado-source-development
 description: 开发、修复、迁移、审计和测试 Legado（阅读3.0）书源与 RSS 订阅源，兼容 HapeLee/legado-with-MD3。处理 Default/CSS/JSONPath/XPath/JS/正则、搜索/发现/详情/目录/正文、分页、URL 请求、Cookie/WebView、导入 JSON、调试日志与 MD3 扩展。触发词：Legado、阅读3.0、MD3阅读、书源、订阅源、RSS源、ruleSearch、ruleToc、ruleContent、ruleArticles、sourceUrl。
-version: 4.0.0
+version: 4.1.0
 ---
 
 # Legado / MD3 规则开发
@@ -195,6 +195,26 @@ python3 /var/minis/skills/legado-source-development/scripts/debug_source.py sour
 - 正文页按**内容特征**判定真伪，不看长度（见下「反爬镜像站」）。
 - 回归：`python3 scripts/test_debug_parser.py`（64 项解析器断言）。
 
+**★失败分型（2026-10-26 新增）**：取不到东西时不再一律报「规则写错了」，而是打一行
+`✗ [phase.CODE] 字段 xxx —— 原因`，便于直接定位。当前码表：
+
+| 码 | 含义 | 处置 |
+|---|---|---|
+| `SELECTOR_EMPTY` | 容器匹配 0 个节点 | 先确认响应是否目标页 |
+| `HARNESS_UNSUPPORTED` | xpath / `@js:` 容器本脚本无法求值 | **记「未评估」，不是源的缺陷** |
+| `TOC_SELECTOR_EMPTY` | chapterList 完全没匹配 | 改 ruleToc.chapterList |
+| `TOC_EMPTY` | 容器命中但章节名全空 | 查 chapterName 是否带 `@text` |
+| `CONTENT_EMPTY` | 取值为空 | 查 ruleContent.content |
+| `CONTENT_TOO_SHORT` | < 100 字符 | 同上 |
+| `CONTENT_IS_LOGIN_PAGE` | 响应像登录页 | 需 Cookie/登录态 |
+| `CONTENT_IS_CAPTCHA_PAGE` | Cloudflare 人机验证 | 不可自动绕过，停并汇报 |
+| `CONTENT_IS_VIP_LOCK_PAGE` | 付费/会员提示 | 只能记 degraded |
+| `CONTENT_IS_CSR_SHELL` | 前端空壳 | 需 webView/webJs |
+| `HTTP_BLOCKED` | 4xx/5xx | 看状态码 |
+
+`HARNESS_UNSUPPORTED` 只表示本脚本能力边界，**不得据此判定书源有缺陷**。
+回归：`python3 scripts/test_debug_classify.py`（13 项）。
+
 **★判读纪律**：调试脚本报「HTTP 400/403/000」时，先手动 `curl` 同一 URL 对照，
 再决定是站点故障、风控，还是脚本自身缺陷。**不要把脚本的缺陷当成规则错误去改规则。**
 
@@ -209,6 +229,20 @@ python3 /var/minis/skills/legado-source-development/scripts/validate_source.py -
 选项：`--strict`（有警告即非零）、`--json`、`--target common|md3`、`--kind auto|book|rss`。
 
 **静态 PASS 只代表 JSON 与已知风险检查通过**，不代表网络、解析器或真机可用。
+
+**★新增静态铁律（2026-10-26，借自上游 official-rule-pack.json，均为纯字符串判定）**：
+
+| 检查 | 级别 | 说明 |
+|---|---|---|
+| `;post=` / `;get=` | error | 请求选项必须写在 URL 后的 JSON（method/body/headers） |
+| jQuery 伪类 `:has/:visible/:hidden` | error | **注意**：`:contains()` 不要报错——参考执行器（soupsieve）可用，成品源大量在用；目标端是否生效须真机核实。`:eq()` 属目标客户端自有扩展，也不报 |
+| `@css:…@text@js:…` 多 action 链 | error | Legado 按「最后一个 `@`」切分，前面的 `@text` 会进选择器；改 `##$##<js>` |
+| `ruleBookInfo.summary` | error | 详情简介真名是 `intro`，写 summary 静默为空 |
+| User-Agent 完整性 | warning | 有 `KHTML/Gecko` 缺 `Chrome/`+`Safari/` 尾段，或被判为脚本客户端 |
+
+UA 检查只针对能静态解析成 JSON 的 header；含 `{{ }}`/`<js>`/`@js:` 的模板值跳过（留给真机）。
+回归：`python3 scripts/test_validator_lint.py`（17 项）、`python3 scripts/test_debug_classify.py`（13 项）。
+
 
 ### 2. 规则执行（本机可用，Python 参考实现）
 

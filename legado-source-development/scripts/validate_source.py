@@ -63,14 +63,30 @@ def check_rule_text(value,where,out,target):
  if not isinstance(value,str):
   add(out,"error",where,f"规则值应为字符串，实际为 {type(value).__name__}"); return
  plain=re.sub(r"<js>[\s\S]*?</js>","",value)
- if plain.count("{{")!=plain.count("}}") : add(out,"error",where,"{{ }} 标记不配对")
+ # 2026-10-26 修：`@js:` 规则里相邻的 `}}`（如 `if(...){...}}` 收尾）曾被当成
+ # 「空占位符 `{{ }}`」，误报「不配对」，逼得规则要写成 `} }` 才能过校验。
+ # 现对 @js:/<js> 规则整段剔除（JS 里不存在 Legado 的 {{ }} 模板占位符）。
+ if value.lstrip().startswith("@js:") or "<js>" in value:
+  plain=re.sub(r"[\s\S]*","",plain)
+ if plain.count("{{")!=plain.count("}}"): add(out,"error",where,"{{ }} 标记不配对")
  if value.count("<js>")!=value.count("</js>"): add(out,"error",where,"<js></js> 标签不配对；@js: 形态不能追加 </js>")
  if target=="md3" and re.search(r"(?:@xpath:|@XPath:|//)[\s\S]*\bnormalize-space\s*\(",value):
   add(out,"error",where,"目标 MD3 真机已确认不支持 XPath normalize-space()")
  if re.search(r"(?:&&|\|\||%%)\s*@css:",value,re.I):
   add(out,"error",where,"CSS 组合规则只在整条规则开头写一次 @css:；分支前重复会进入 Jsoup 选择器并解析失败")
+ # —— 以下 5 类静态铁律，思路借自 Narylr350/book-source-creator-skill 的
+ # references/official-rule-pack.json（官方教程来源），2026-10-26 适配。
+ # 均为纯字符串判定，不需要执行引擎。
+ if re.search(r";\s*(?:post|get)\s*=",value,re.I):
+  add(out,"error",where,"POST/GET 请求选项应写在 URL 后的 JSON 选项（method/body/headers），不支持 ;post= 或 ;get=")
+ if re.search(r":\s*(?:has|visible|hidden)\s*\(",value) and not where.endswith(("nextContentUrl","nextTocUrl")):
+  add(out,"error",where,"疑似 jQuery 扩展伪类（:has/:visible/:hidden）。注意目标 MD3 的 Jsoup 基于 CSS 引擎，:contains() 类文本匹配是否生效须真机核实；标准 CSS 更稳妥")
  # 这里只做保守文本检查，不解析或执行 JS；动态规则交由目标引擎验证。
  selector=plain.split("@js:",1)[0].split("##",1)[0].strip()
+ # @css 多 action 链：Legado 按「最后一个 @」切分取值，`@css:sel@text@js:...`
+ # 会把 @text 当成选择器的一部分导致 Jsoup 解析失败。改用 `##$##` 或单 action。
+ if re.match(r"@css:",value.strip(),re.I) and value.count("@")>2 and "@js:" in value:
+  add(out,"error",where,"@css 多 action 链（如 @css:sel@text@js:…）会被「最后一个 @」切分规则误解析；取值用单一 @action，后处理改用 ##$##<js> 或 @js:")
  if where.endswith("nextTocUrl"):
   # 覆盖 CSS 模式头、Default tag.select、id/class 和属性；不匹配
   # select option@value、.select@value 或 [data-label='select@value']。
@@ -91,6 +107,34 @@ def check_rule_text(value,where,out,target):
  if opt is not None and "body" in opt and not isinstance(opt["body"],str):
   add(out,"warning",where,"静态请求 body 不是字符串")
 
+def check_ua(h,where,out):
+ """UA 完整性（借自上游 webview-behavior-matrix / legado-source-behavior）。
+
+ 截断的 UA（缺 Chrome/版本号或 Safari/ 尾段）会被反爬系统判为非标准客户端。
+ 上游实测结论：UA 必须保留 `(KHTML, like Gecko) Chrome/<ver> Safari/<ver>` 完整性。
+ 只对「能静态解析成 JSON」的 header 生效；含模板/JS 的留给真机。
+ """
+ if not isinstance(h,str) or not h.strip().startswith("{"): return
+ if any(k in h for k in ("{{","<js>","@js:")): return
+ try: obj=json.loads(h)
+ except (json.JSONDecodeError,ValueError): return
+ if not isinstance(obj,dict): return
+ ua=next((v for k,v in obj.items() if isinstance(k,str) and k.lower()=="user-agent"),None)
+ if ua is None: return
+ if not isinstance(ua,str):
+  add(out,"error",where,"User-Agent 应为字符串"); return
+ u=ua.strip()
+ if not u: add(out,"error",where,"User-Agent 为空字符串"); return
+ has_gecko="like Gecko" in u or "KHTML" in u
+ has_chrome=re.search(r"Chrome/\d+",u)
+ has_safari=re.search(r"Safari/\d+",u)
+ if has_gecko and not (has_chrome and has_safari):
+  add(out,"warning",where,"UA 疑似截断（有 KHTML/Gecko 却缺 Chrome/版本号或 Safari/ 尾段）；反爬常据此判为非浏览器客户端")
+ elif has_chrome and not has_safari:
+  add(out,"warning",where,"UA 疑似截断（有 Chrome/版本号但缺 Safari/ 尾段）；完整的 Chrome UA 以 `Safari/<ver>` 结尾")
+ elif not has_gecko and not has_chrome:
+  add(out,"warning",where,"UA 不含 Chrome/Safari 标识，形似脚本客户端；部分站点会直接拒绝")
+
 def check_book(x,label,out,target):
  for f in BOOK_REQUIRED:
   if not isinstance(x.get(f),str) or not x[f].strip(): add(out,"error",label,f"缺少非空字符串字段 {f}")
@@ -106,6 +150,7 @@ def check_book(x,label,out,target):
   try:
    if not isinstance(json.loads(h),dict): add(out,"error",label+".header","header 应为 JSON 对象字符串")
   except json.JSONDecodeError as e: add(out,"error",label+".header",f"header JSON 非法：{e.msg}")
+ check_ua(h,label+".header",out)
  for rn,known in BOOK_RULES.items():
   rule=x.get(rn)
   if rule is None: continue
@@ -119,6 +164,8 @@ def check_book(x,label,out,target):
  if target=="md3" and isinstance(x.get("ruleBookInfo"),dict):
   bi=x["ruleBookInfo"]
   full=label+".ruleBookInfo."
+  # ruleBookInfo.summary 不是阅读字段（真名 intro）。写错不报错、静默为空。
+  if "summary" in bi: add(out,"error",full+"summary","字段错名：详情简介真名是 intro，summary 会被忽略且静默为空")
   for bad,why in KNOWN_BAD_FIELDS.items():
    f=bad.split(".",1)[1]
    if f in bi: add(out,"error",full+f,"错名，MD3 基线为 "+why)
