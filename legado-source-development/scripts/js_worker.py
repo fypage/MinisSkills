@@ -79,7 +79,7 @@ class NodeWorker:
             self._proc = None
             return False
 
-    def eval(self, rule, base_url, subrules=None, binds=None, timeout=60.0):
+    def eval(self, rule, base_url, subrules=None, binds=None, charset=None, timeout=60.0):
         """返回 (out, log)。宿主不可用时退回一次性调用。"""
         if not self._ensure():
             return self._one_shot(rule, base_url, subrules, binds)
@@ -87,6 +87,9 @@ class NodeWorker:
             self._seq += 1
             req = {'id': self._seq, 'rule': rule, 'baseUrl': base_url,
                    'subrules': dict(subrules or {}), 'binds': dict(binds or {})}
+            if charset:
+                # GBK 站点：java.ajax 收到的字节需按响应 charset 解码（真机同样处理）
+                req['charset'] = charset
             try:
                 self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + '\n')
                 self._proc.stdin.flush()

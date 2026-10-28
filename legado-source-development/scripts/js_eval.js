@@ -98,8 +98,12 @@ function evaluate(rule, baseUrl, subrules, bindsIn) {
     ajax(u) {
       logs.push(String(u));
       try {
-        return execSync('curl -sL --max-time 30 -A "curl/8.5.0" ' + JSON.stringify(String(u)),
-          { maxBuffer: 64 * 1024 * 1024 }).toString('utf8');
+        // ★ 2026-10-27 修：必须 --compressed（站点可能无视 Accept-Encoding 直接回 gzip），
+        //   且按响应头 charset 解码。真机 OkHttp 自动解压；Rhino 的 String 是 UTF-16，
+        //   GBK 站点若按 utf8 解会整段乱码 → 看着像规则错。默认 utf-8，可用 cfg.charset 覆盖。
+        const enc = (cfg && cfg.charset) || 'utf-8';
+        return execSync('curl -s -L --compressed --max-time 30 -A "curl/8.5.0" ' + JSON.stringify(String(u)),
+          { maxBuffer: 64 * 1024 * 1024 }).toString(enc);
       } catch (e) { return ''; }
     },
     getString(rule) { return (cfg.subrules && cfg.subrules[rule] !== undefined) ? cfg.subrules[rule] : ''; },

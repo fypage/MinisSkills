@@ -489,6 +489,10 @@ def css_values(html, payload, multi_join="\n", list_root=False):
 
 DEFAULT_PART_RE = re.compile(r"^(?P<tag>[A-Za-z][\w-]*)\.(?P<cls>[\w-]+)")
 
+# 含 `A > B` 或多级后代空格的 Default 规则属于合法 CSS 组合写法；旧实现按
+# `.` / `>` 硬切，会把 `h2.bookname > a@text` 的 `a` 当成取值部分而恒返回空。
+CSS_COMBO_RE = re.compile(r"\s*>|\s+[A-Za-z*.#\[]")
+
 
 def default_values(html, payload):
     """支持子集：tag.class / .class / tag#id / tag，位置与 @取值。"""
@@ -510,45 +514,71 @@ def default_values(html, payload):
         if at < 0:
             raise SelectorError(f"Default 规则缺少 @取值: {seg}")
         head, attr = seg[:at], seg[at + 1:]
-        root = lhtml.fromstring(html)
-        index = None
-        m = re.search(r"\.(?P<idx>-?\d+)$", head)
-        if m:
-            index = int(m.group("idx"))
-            head = head[:m.start()]
-        segs = [s for s in re.split(r"[.>]", head.lstrip(".")) if s]
-        nodes = [root]
-        for s in segs:
-            nxt = []
-            for n in nodes:
-                if "." in s:
-                    tag, cls = s.split(".", 1)
-                    nxt.extend(n.xpath(f".//{tag or '*'}[contains(concat(' ',normalize-space(@class),' '),' {cls} ')]"))
-                elif s.startswith("#"):
-                    nxt.extend(n.xpath(f".//*[@id='{s[1:]}']"))
-                else:
-                    nxt.extend(n.xpath(f".//{s}"))
-            nodes = nxt
-        if index is not None and nodes:
-            nodes = [nodes[index]]
-        vals = []
-        for n in nodes:
-            if attr == "text":
-                v = " ".join(n.itertext()).strip()
-            elif attr == "textNodes":
-                v = (n.text or "").strip()
-            elif attr == "html":
-                v = lhtml.tostring(n, encoding="unicode")
-            elif attr == "href" or attr == "src":
-                v = n.get(attr, "")
-            else:
-                v = n.get(attr, "") or " ".join(n.itertext()).strip()
-            if v:
-                vals.append(v)
-        if conn == "||" and vals:
-            out.extend(vals)
+        # ★ 2026-10-27 修：原实现把 head 按 `.` / `>` 硬切再逐层 .// 取，凡是
+        #   CIDR 组合写法（`h2.bookname > a`、`div.cat > a`、`div#content.x`、
+        #   `a.b.c`、`div#allchapter dl > dd > a`）都会把后半段吞进取值部分，
+        #   字段恒返回空——这是把合法规则误判成源缺陷的主因。凡 head 不是
+        #   「tag.class / .class / tag#id / tag」这种单一简单选择器，一律交给
+        #   CSS 引擎（含 :eq / :contains / 属性选择器）。
+        if "@" not in head and not _SIMPLE_DEFAULT_RE.fullmatch(head.strip()):
+            els = _select_elements(html, head.strip())
+            try:
+                from lxml import html as lhtml2
+            except ImportError:
+                lhtml2 = None
+            vals0 = [v for v in (_val_from_element(x, attr, lhtml2) for x in els) if v]
+        else:
+            vals0 = _default_simple(html, head, attr)
+        if conn == "||" and vals0:
+            out.extend(vals0)
             break
-        out.extend(vals)
+        out.extend(vals0)
+    return out
+
+
+_SIMPLE_DEFAULT_RE = re.compile(r"^(?:[A-Za-z][\w-]*)?(?:\.([\w-]+))?(?:#[\w-]+)?$")
+
+
+def _default_simple(html, head, attr):
+    """兼容旧写法：tag.class / .class / tag#id / tag（可带 .n 位序）。"""
+    from lxml import html as lhtml
+    root = lhtml.fromstring(html)
+    out = []
+    index = None
+    m = re.search(r"\.(?P<idx>-?\d+)$", head)
+    if m:
+        index = int(m.group("idx"))
+        head = head[:m.start()]
+    segs = [s for s in re.split(r"[.>]", head.lstrip(".")) if s]
+    nodes = [root]
+    for s in segs:
+        nxt = []
+        for n in nodes:
+            if "." in s:
+                tag, cls = s.split(".", 1)
+                nxt.extend(n.xpath(f".//{tag or '*'}[contains(concat(' ',normalize-space(@class),' '),' {cls} ')]"))
+            elif s.startswith("#"):
+                nxt.extend(n.xpath(f".//*[@id='{s[1:]}']"))
+            else:
+                nxt.extend(n.xpath(f".//{s}"))
+        nodes = nxt
+    if index is not None and nodes:
+        nodes = [nodes[index]]
+    vals = []
+    for n in nodes:
+        if attr == "text":
+            v = " ".join(n.itertext()).strip()
+        elif attr == "textNodes":
+            v = (n.text or "").strip()
+        elif attr == "html":
+            v = lhtml.tostring(n, encoding="unicode")
+        elif attr == "href" or attr == "src":
+            v = n.get(attr, "")
+        else:
+            v = n.get(attr, "") or " ".join(n.itertext()).strip()
+        if v:
+            vals.append(v)
+    out.extend(vals)
     return out
 
 
@@ -667,6 +697,17 @@ def eval_rule(rule, html, base="", nodes=None, list_root=False):
         values = regex_all_values(html, payload)
     elif mode == "css":
         values = css_values(html, payload, list_root=list_root)
+        if list_root:
+            # ★ 2026-10-27 修：css_values 在 list_root 分支已返回「节点 HTML 片段」，
+            #   但随后 apply_post 会再跑一遍 default_values（片段含 '@' 即抛
+            #   SelectorError），dedupe 后 count 只剩 1 —— 任何 bookList/chapterList
+            #   都表现为「只有 1 条」。列表上下文不得再做二次取值。
+            return values
+    elif list_root:
+        # 未写模式头的纯选择器容器（如 `div.bookbox`）：Legado 的 Default 同样接受
+        # CSS 选择器，这里按列表上下文取节点，不走 default_values（它要求 @取值）。
+        values = css_values(html, "@css:" + payload, list_root=True)
+        return values
     elif mode == "json":
         values = json_values(json.loads(html) if isinstance(html, str) else html, payload)
     elif mode == "xpath":

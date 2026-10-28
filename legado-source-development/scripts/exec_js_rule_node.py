@@ -91,7 +91,7 @@ def _balanced(fragment):
 
 
 
-def build_driver(js_body, base_url, subrules, binds=None):
+def build_driver(js_body, base_url, subrules, binds=None, charset=None):
     """生成 node driver。
 
     java.ajax       -> execSync('curl')，最贴近 Rhino 的同步语义
@@ -114,15 +114,17 @@ def build_driver(js_body, base_url, subrules, binds=None):
     return '''
 const { execSync } = require('child_process');
 const SUBS = %s;
+const ENC = %s;
 const LOG = [];
 global.baseUrl = %s;
 %s
 global.java = {
   ajax: function(u){
     LOG.push(String(u));
-    const out = execSync('curl -s --max-time 30 -A "curl/8.5.0" ' + JSON.stringify(String(u)),
+    // ★ 2026-10-27：同 js_eval.js —— 加 --compressed，并按 ENC 解码
+    const out = execSync('curl -s -L --compressed --max-time 30 -A "curl/8.5.0" ' + JSON.stringify(String(u)),
                          {maxBuffer: 64*1024*1024});
-    return out.toString('utf8');
+    return out.toString(ENC);
   },
   getString: function(rule){ return SUBS[rule] !== undefined ? SUBS[rule] : ''; },
   encodeURI: function(s){ return encodeURIComponent(String(s)); },
@@ -176,10 +178,10 @@ try {
 }
 if (typeof out === 'undefined' || out === null) out = '';
 process.stdout.write(JSON.stringify({out: out, log: LOG, err: ERR}));
-''' % (sub_json, json.dumps(base_url), bind_js, json.dumps(js_body))
+''' % (sub_json, json.dumps(charset or 'utf-8'), json.dumps(base_url), bind_js, json.dumps(js_body))
 
 
-def run(rule, base_url, subrules=None, binds=None):
+def run(rule, base_url, subrules=None, binds=None, charset=None):
     """执行 @js: 规则。
 
     ★ 不再用 Python 去猜「哪一段是结尾表达式」——JS 的字符串、正则、模板串
@@ -192,7 +194,7 @@ def run(rule, base_url, subrules=None, binds=None):
       常驻后单条约 0.6 ms。worker 不可用时自动退回一次性调用。
     """
     from js_worker import shared_worker
-    out, log = shared_worker().eval(rule, base_url, subrules, binds)
+    out, log = shared_worker().eval(rule, base_url, subrules, binds, charset)
     return out, log or []
 
 

@@ -127,7 +127,9 @@ def check_rule_text(value,where,out,target):
   else:
    add(out,"warning",where,"nextContentUrl 含章节导航文字；可能用于 :not/not()/过滤排除，不据此判错；须验证结果仅为同一章节续页")
  opt,err=url_option(value)
- if err and not any(x in value for x in ("<js>","@js:")):
+ # 2026-10-27 修：模板占位符（{{page}}、<,{{page}}>）以 `}` 收尾，紧跟的 `,{...}`
+ # 会被切在占位符内部而 JSONDecodeError("Extra data")。半截候选并非尾部选项语法错误。
+ if err and not any(x in value for x in ("{{","<,","<js>","@js:")):
   add(out,"error",where,f"URL 尾部选项疑似非法 JSON：{err.msg}")
  if opt is not None and "body" in opt and not isinstance(opt["body"],str):
   add(out,"warning",where,"静态请求 body 不是字符串")

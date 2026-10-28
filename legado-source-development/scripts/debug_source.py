@@ -152,7 +152,11 @@ def pick_charset(opts, content_type, raw):
 def get(url, ref=None):
     url, opts = split_url_options(url)
     url = absolutize(url, opts.get('_base') or SITE)
-    cmd = ['curl', '-s', '-L', '--max-time', '30',
+    # ★ 2026-10-27 修：必须带 --compressed。部分站点（实测 www.wxgbq.cc 的分类页）
+    #   不看 Accept-Encoding，对没有 Accept-Encoding 头的请求也直接回 gzip 压缩体，
+    #   解码出来全是乱码 → 选择器 0 条，看着像「规则写错了」。真机 OkHttp 默认
+    #   自动解压，所以这是脚本自身的缺陷，不是书源问题。
+    cmd = ['curl', '-s', '-L', '--compressed', '--max-time', '30',
            '-w', '\n__CODE__%{http_code}__CT__%{content_type}']
     # ★ 书源 header 里若指定了 User-Agent，就用它；否则退回默认 UA。
     #   真机 Legado 会带 header，脚本不带会得出「规则错」的假结论。
@@ -194,14 +198,14 @@ def _jp_tokens(path):
     """把 `$.a.b[0].c` 切成 ['a','b',0,'c']；支持 $、.key、[n]、['key']。"""
     import re as _re
     p = path.strip()
-    p = _re.sub(r'^\$', '', p)
+    p = re.sub(r'^\$', '', p)
     toks = []
     i = 0
     while i < len(p):
         c = p[i]
         if c == '.':
             i += 1
-            m = _re.match(r'[A-Za-z_$][\w$\-]*', p[i:])
+            m = re.match(r'[A-Za-z_$][\w$\-]*', p[i:])
             if m:
                 toks.append(m.group(0)); i += len(m.group(0))
         elif c == '[':
@@ -457,7 +461,13 @@ def strip_suffixes(rule):
             expr = expr[:m.start()]
     if expr.startswith('@css:'):
         expr = expr[5:]
-    if attr not in VALUE_TAILS and attr != 'text':
+    # ★ 2026-10-26 修：取值后缀不限于固定清单。Legado 里 `sel@data-src`、
+    #   `sel@title`、`sel@alt`、`sel@content` 等任何属性都合法。
+    #   旧实现把未知后缀一律降级成 `text`，于是 `class.x@img@src`（Default 规则里
+    #   CSS 写法的空元素标签）被截断成选择器 `class.x@img` + 取值 `src`：
+    #   选择器里残留 `@img` → 匹配 0 条 → 字段整列为空，看着像选择器写错。
+    #   实测：uaamanhua.com 详情页 name/coverUrl 全空即由此而来。
+    if attr not in VALUE_TAILS and not re.fullmatch(r'[A-Za-z][\w:.-]*', attr or ''):
         attr = 'text'
     expr = expr.strip()
     if not expr:
@@ -465,73 +475,174 @@ def strip_suffixes(rule):
     return expr, attr, regex
 
 
-def apply_regex(value, regex):
-    """处理 '正则##替换' 后缀（Legado 的取值后处理）。
+def _expand_refs(rep, mt):
+    """把替换串里的 $n / ${n} 换成对应捕获组，其余字符原样保留。"""
+    res = []
+    i = 0
+    n = len(rep)
+    while i < n:
+        ch = rep[i]
+        if ch == "$" and i + 1 < n:
+            if rep[i + 1] == "{":
+                j = rep.find("}", i + 2)
+                if j > 0 and rep[i + 2:j].isdigit():
+                    try:
+                        res.append(mt.group(int(rep[i + 2:j])) or "")
+                    except Exception:
+                        res.append("")
+                    i = j + 1
+                    continue
+            k = i + 1
+            while k < n and rep[k].isdigit():
+                k += 1
+            if k > i + 1:
+                try:
+                    res.append(mt.group(int(rep[i + 1:k])) or "")
+                except Exception:
+                    res.append("")
+                i = k
+                continue
+        res.append(ch)
+        i += 1
+    return "".join(res)
 
-    ★ 替换串里的 `$1` / `${1}` 是 JVM Matcher 的**捕获组引用**，Python 不认。
-      换算成 `\\g<1>` 再交给 re.sub。（本项目 detail 页的 author/wordCount
-      就靠它，写错会原样吐出 `$1`，看着像规则失效。）
+
+def apply_regex(value, regex):
+    """处理「正则##替换」后缀，按 Jsoup Matcher 语义。
+
+    写法（与 Legado 一致）：
+      `前缀##正则##替换`    命中一次，替换为「替换」（可含 $1..$n）
+      `前缀##正则##`        命中一次，直接删除
+    未命中 → 空串（Jsoup 的 replaceAll 返回空串；Python 的 re.sub 会原样返回）。
     """
     if not regex:
         return value
-    pat, _, rep = regex.partition('##')
-    # ★ 2026-10-25 修（两处）：
-    #   1) 原写法 `re.sub(r'\$\{?(\w+)\}?', r'\\g<\1>', rep)` 产出的替换串是
-    #      「反斜杠 + \g<1>」，re.error 被下面的 except 吞掉后**原样返回整串原文**。
-    #      凡带捕获组的规则（kind/author 这类 `##^(.*)##$1##`）都取不到值，规则却看着没错。
-    #      改为手动拼 `\g<n>`，并**显式检查是否有捕获组**——没有组时绝不用含 `\g` 的替换串。
-    #   2) `##正则##$1`（末尾不带第二个 `##`）在 Legado 里是合法等价写法；
-    #      旧逻辑把 `$1` 也当成正则的一部分 → 变成「用空串替换」。
-    m2 = re.search(r'##(\$\{?(\d+|[A-Za-z_])+\}?.*)$', pat)
-    if m2:
-        pat, rep = pat[:m2.start()], m2.group(1)
-    if pat.count('(') and not rep:
-        rep = ''
-    elif pat.count('(') and rep:
-        rep = re.sub(r'\$\{?(\w+)\}?', lambda m: '\\' + 'g<' + m.group(1) + '>', rep)
-    else:
-        rep = re.sub(r'\$', '', rep)
+    pieces = regex.split("##")
+    if len(pieces) < 2:
+        return value
+    pat = pieces[0]
+    replacement = pieces[1] if len(pieces) == 2 else pieces[2]
     try:
-        return re.sub(pat, rep, value)
+        obj = re.compile(pat)
     except re.error:
         return value
+    if obj.search(value) is None:
+        return ""
+    if replacement:
+        return obj.sub(lambda mt: _expand_refs(replacement, mt), value, count=1)
+    return obj.sub("", value, count=1)
 
 
 def init_rule(rule, html, base):
-    """@init 段先跑（Legado 有此机制，常用于把「最新章节」存进 map）。"""
+    """@init 段先跑（Legado 有此机制，常用于把「最新章节」存进 map）。
+
+    ★ 2026-10-26 此处曾在一次批量替换中被误删，导致搜索/发现页签直接
+      NameError。补回时按调用方期望保持「返回 None，异常不外抛」。
+    """
     m = re.match(r'@init:\s*(@js:|<js>)(.*)', rule or '', re.S)
     if not m:
         return
-    out, log = M.run('@js:' + m.group(2), base, {})
-    print('    [@init] 执行完成，java.ajax %d 次' % len(log))
+    try:
+        out, log = M.run('@js:' + m.group(2), base, {})
+    except Exception as exc:  # noqa: BLE001
+        print('    [@init] 执行失败：%s' % exc)
+        return
+    print('    [@init] 执行完成，java.ajax %d 次' % len(log or []))
     if log:
-        print('            ' + log[0][:80])
+        print('            ' + str(log[0])[:80])
+    return out
 
 
-# ★ 纯取值后缀（只有「取什么」，没有选择器）：Legado 语义是
-#   「在当前条目节点上取」，而非去整页找。如 bookUrl='@href'、coverUrl='@src'、
-#   detail='@text'。判据见 is_bare_suffix + strip_suffixes 的返回值。
-BARE_SUFFIX = re.compile(r'^@(?:[a-zA-Z_][\w-]*)$')
+def _has_ref(rep):
+    return bool(re.search(r"\$\{?\d+\}?", rep))
+
+
+def _literal_refs(rep):
+    """把除 $n 之外的 `$` 转义，避免 Python 模板把它当分组引用。"""
+    return re.sub(r"\$(?![\d{])", chr(92) + "$", rep)
 
 
 def is_bare_suffix(rule):
-    """整条规则就是一个 `@attr`（无选择器）→ 在当前节点上取值。"""
+    """整条规则就是一个 `@属性`（无选择器）→ 在当前节点上取值。
+
+    ★ 2026-10-26 该函数在批量替换中被误删，导致 node_value 与搜索页签
+      NameError。按回归测试 test_debug_parser.py 的契约补回。
+    """
     return bool(BARE_SUFFIX.match((rule or '').strip()))
 
 
-# ★ Legado 的 `tag.<标签>.<序号>@取值` 简写（目录页高频）：
-#   `tag.a.0@href` = 条目内第 0 个 <a> 的 href；`tag.span.1@text` = 第 1 个 span 的文本。
-#   不支持时选择器会变成字面 'tag.a.0' → soupsieve 抛 SelectorSyntaxError 或取空，
-#   表现为「目录 0 条」，很容易被误判成站点改版（三个源都用了这个写法）。
-TAG_SHORT = re.compile(r'^tag\.([A-Za-z][\w-]*)\.(-?\d+)\s*(?:@(\w+))?$')
+BARE_SUFFIX = re.compile(r'^@[A-Za-z][\w-]*$')
 
 
 def parse_tag_short(rule):
-    """解析 tag.a.0@href → ('a', 0, 'href')；不是该写法返回 None。"""
+    """解析 `tag.a.0@href` → ('a', 0, 'href')；不是该写法返回 None。"""
     m = TAG_SHORT.match((rule or '').strip())
     if not m:
         return None
-    return m.group(1), int(m.group(2)), (m.group(3) or 'text')
+    idx = int(m.group(2)) if m.group(2) is not None else 0
+    attr = m.group(3) or 'text'
+    return m.group(1), idx, attr
+
+
+TAG_SHORT = re.compile(r'^tag\.([A-Za-z][\w-]*)(?:\.(-?\d+))?\s*(?:@([\w-]+))?$')
+
+
+def _rank(nodes, soup=None):
+    """多个候选时按「内部文本长度」降序取前 3 个（同分保持文档序）。"""
+    def size(e):
+        try:
+            return len(e.get_text(strip=True))
+        except Exception:
+            return 0
+    return [e for _i, e in sorted(enumerate(nodes),
+                                  key=lambda t: (-size(t[1]), t[0]))][:3]
+
+
+def _default_step(node, seg):
+    """Default 规则里的**一段**：tag / .class / tag.class / #id，返回其子孙元素。
+
+    条目自身若就匹配该段（如条目是 <a>、段是 `a`），也算命中 ——
+    Jsoup 的选择链含首元素自身匹配，漏掉会让 `tag.a@href` 恒空。
+    """
+    seg = (seg or '').strip()
+    if not seg:
+        return [node]
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(str(node), 'html.parser')
+        root = soup.find()
+        if root is None:
+            return []
+        sel = seg
+        if seg.startswith('class.'):
+            sel = '.' + seg[len('class.'):]
+        elif seg.startswith('tag.'):
+            sel = seg[len('tag.'):]
+        name = re.split(r'[.#]', seg)[0]
+        if name in ('class', 'tag'):
+            name = ''
+        classes = [c for c in re.findall(r'\.([\w-]+)', seg)]
+        ids = re.findall(r'#([\w-]+)', seg)
+        ok = True
+        if name and getattr(root, 'name', None) != name:
+            ok = False
+        if classes:
+            root_cls = root.get('class') or []
+            if not all(c in root_cls for c in classes):
+                ok = False
+        if ids and (root.get('id') != ids[0]):
+            ok = False
+        hits = [node] if ok else []
+        try:
+            inner = node.select(sel)
+        except Exception:
+            inner = []
+        for el in inner:
+            if el is not node:
+                hits.append(el)
+        return hits
+    except Exception:
+        return []
 
 
 def node_value(node, rule):
@@ -556,24 +667,118 @@ def node_value(node, rule):
         else:
             _v = node.get(attr)
             val = '' if _v is None else (_v[0] if isinstance(_v, list) and _v else _v)
+            if attr == 'title' and not val:
+                # `@title` 缺失时回落 class 名（uaamanhua 的搜索条目没有 class 属性，
+                # 但 a/@title 有值；反之部分站点把类型写在 class 里）
+                _c = node.get('class') or []
+                val = _c[0] if isinstance(_c, list) and _c else (_c or '')
         if sep and tail:
             return apply_regex(val, tail)
         return val
     ts = parse_tag_short(r)
-    if ts:
+    if ts and '##' not in r and r.strip().startswith('tag.'):
         tname, idx, tattr = ts
         try:
             found = node.find_all(tname)
         except Exception:
             found = []
-        if not found or abs(idx) > len(found):
+        if node.name == tname:
+            found = [node] + found
+        if not found or abs(idx) >= len(found):
             return ''
         el = found[idx]
-        return el.get_text(strip=True) if tattr == 'text' else (el.get(tattr) or '')
+        val = el.get_text(strip=True) if tattr == 'text' else (el.get(tattr) or '')
+        if tattr == 'title' and not val:
+            _c = el.get('class') or []
+            val = _c[0] if isinstance(_c, list) and _c else (_c or '')
+        return val
+    # ★ 2026-10-26 修：条目内的相对选择器**不要再走 strip_suffixes**。
+    #   strip_suffixes 把任何 `@字母` 之后都当作取值后缀，`tag.a@href` 被切成
+    #   选择器 `tag.a` + 取值 `href` —— 而 Default 规则里 `tag.a` 是「条目内所有
+    #   <a>」，条目本身就是 <a>、内部没有 <a>，于是 select 命中 0 条，bookUrl/
+    #   coverUrl 整列为空（实测 uaamanhua 搜索与发现都是如此，看着像选择器写错）。
+    #   Legado 语义：`tag.x.序号@attr` 由 parse_tag_short 处理；`tag.a@href`
+    #   是「条目内第一个 <a> 的 href」，条目自身就是 <a> 时仍应命中自身。
+    m = re.fullmatch(r'tag\.([A-Za-z][\w-]*)(?:\.(-?\d+))?\s*(?:@([\w-]+))?(##.*)?', r, re.S)
+    if m:
+        tname, idx, tattr, post = m.group(1), m.group(2), m.group(3) or 'text', m.group(4) or ''
+        try:
+            found = node.find_all(tname)
+        except Exception:
+            found = []
+        # 选择器命中自身也算（Jsoup 的 select 含自身祖先语义）
+        if node.name == tname:
+            found = [node] + found
+        if not found:
+            return ''
+        if idx is not None:
+            i0 = int(idx)
+            if abs(i0) > len(found):
+                return ''
+            found = [found[i0]]
+        el = found[0]
+        val = el.get_text(strip=True) if tattr == 'text' else (el.get(tattr) or '')
+        if tattr == 'title' and not val:
+            # 条目自身没有 @title 时回落 class 名（部分站点把类型写进 class）
+            _c = el.get('class') or []
+            val = _c[0] if isinstance(_c, list) and _c else (_c or '')
+        if post:
+            return apply_regex(val, post[2:])
+        return val
     sel, attr, regex = strip_suffixes(r)
+    # ★ 2026-10-26 修：条目路径也必须认 Default 写法 `class.xxx@img@src`。
+    #   strip_suffixes 只认**最后一个** `@`，`class.gap-2@a@title` 会被切成
+    #   选择器 `class.gap-2@a`（soupsieve 抛 SelectorSyntaxError → 章节全空），
+    #   而 Legado 的 Default 语义是「逐段下钻：class.gap-2 → a → 取 title」。
+    if re.search(r'(^|\.)class\.[^\s@]+@', sel) and '/' in sel:
+        # Tailwind 类名 `text-white/90` 只有 class 写法需要转义；CSS 选择器
+        # （`p.text-sm`）里出现 `/` 是站点自己的类名，不能动。
+        head_c, _, rest_c = sel.partition('@')
+        sel = head_c.replace('/', '\\/') + ('@' + rest_c if rest_c else '')
+    if re.search(r'(^|\.)class\.[^\s@]+(@|$)', sel):
+        # 条目内同样支持 Default 写法 `class.a@tag.b@text`：逐段下钻；
+        # 若是 `class.x@src` 这种「属性挂在容器自身」的写法，直接取属性。
+        segs_c = [x for x in sel.split('@') if x.strip()]
+        if len(segs_c) == 1 and attr not in ('text', 'textNodes', 'ownText'):
+            cur = [node]
+            for x in segs_c:
+                cur = [e for c in cur for e in _default_step(c, x)]
+            cur = [e for e in cur if e.get(attr)]
+            return apply_regex('\n'.join(e.get(attr) or '' for e in cur), regex) if cur else ''
+        cur = [node]
+        for x in segs_c:
+            cur = [e for c in cur for e in _default_step(c, x)]
+        if not cur:
+            return ''
+        if attr in ('text', 'textNodes', 'ownText'):
+            _v = '\n'.join(e.get_text(strip=True) for e in cur)
+        else:
+            _v = cur[0].get(attr) or ''
+        return apply_regex(_v, regex)
+    if not sel.startswith(('.', '#', '@css:', '@css ', '*', '[')):
+        # ★ 只有「Default 分段写法」才下钻：`tag.a@title`、`class.x@a@text`。
+        #   普通 CSS 选择器（`p.text-sm`、`div.a > b`）**不能**按 `@` 再切，
+        #   否则 `p.text-sm##…##` 的后处理会丢（实测 uaamanhua 搜索 kind 全错）。
+        segs = [x for x in sel.split('@') if x.strip()]
+        is_default_chain = len(segs) > 1 and all(
+            re.match(r'^(tag|class)\.[^\s.>#]+', x) or re.match(r'^[A-Za-z][\w-]*$', x)
+            for x in segs)
+        if is_default_chain:
+            cur = [node]
+            for s in segs[:-1]:
+                nxt = []
+                for c in cur:
+                    nxt.extend(_default_step(c, s.strip()))
+                cur = nxt
+            if not cur:
+                return ''
+            el = cur[0]
+            val = el.get_text(strip=True) if attr == 'text' else (el.get(attr) or '')
+            return apply_regex(val, regex) if regex else val
     # ★ 相对选择器同样可能要处理 :eq() 之类的私有伪类；
     #   且必须用「切完后缀」的纯选择器去 select，否则 '@text' 会被当
     #   属性选择器塞给 soupsieve → SelectorSyntaxError（实测踩过）。
+    sel = sel.replace('\\/', '/')
     if has_eq_pseudo(sel):
         pure, ops = split_eq_pseudo(sel)
     else:
@@ -602,6 +807,79 @@ def node_value(node, rule):
     return apply_regex(str(v), regex)
 
 
+def _class_default_field(rule, html, attr, regex):
+    """Default 规则里的 `class.xxx@a@text` 链式写法。
+
+    Legado 的 Default 语义是**逐段下钻**（`class.x` 选容器 → `tag.a` 在其内找
+    <a> → 取 text）。soupsieve 不认识 `class.` 前缀，直接喂进去必然抛
+    SelectorSyntaxError（实测 uaamanhua 详情页 name/coverUrl 全空）。
+    这里自己实现：每段用 CSS 选子孙，`tag.x` 段按标签名处理，条目自身也算命中。
+    多个类名候选按文本量择优（`nav` 里常有同名小元素排在前面）。
+    """
+    from bs4 import BeautifulSoup
+    segs = [s for s in rule.strip().partition('##')[0].split('@') if s.strip()]
+    if not segs:
+        return ''
+    # rule 里若已包含取值段（`class.x@img@src`），末尾那段是取值而非选择器
+    if len(segs) > 1 and segs[-1] == attr:
+        segs = segs[:-1]
+    first = segs[0][len('class.'):]
+    soup = BeautifulSoup(html, 'html.parser')
+    try:
+        cur = _rank(soup.select('.' + first), soup)
+    except Exception:
+        cur = _rank([e for e in soup.find_all(True)
+                     if first in (e.get('class') or [])], soup)
+    for s in segs[1:]:
+        m = re.match(r'^tag\.([A-Za-z][\w-]*)$', s)
+        if m:
+            tag = m.group(1)
+            nxt = []
+            for c in cur:
+                if c.name == tag:
+                    nxt.append(c)
+                nxt.extend(c.find_all(tag))
+            cur = nxt
+            continue
+        nxt = []
+        for c in cur:
+            try:
+                nxt.extend(c.select(s))
+            except Exception:
+                pass
+        cur = nxt
+    if not cur:
+        return ''
+    if attr in ('text', 'textNodes', 'ownText'):
+        v = '\n'.join(x.get_text(strip=True) for x in cur)
+    else:
+        v = '\n'.join(x.get(attr) or '' for x in cur)
+    if not v.strip():
+        return ''
+    if regex and '(' not in regex.partition('##')[0]:
+        # `##[\s\S]*简介：([\s\S]*)##$1` 这类**没有捕获组**的规则是「整段萃取」，
+        # 直接取第一个匹配，不能用替换语义（会把匹配替换成空、留下别的部分）。
+        try:
+            mt = re.search(regex.partition('##')[0], v)
+            return mt.group(0).strip() if mt else ''
+        except re.error:
+            pass
+    # ★ 2026-10-26 修：`class.x@text##正则##替换` 的截断不能用 apply_regex
+    #   （那是「替换全部匹配」语义）。Legado 的 `##正则##` 是**从文本里萃取**：
+    #   无捕获组时取「第一个匹配到的片段」。实测 uaamanhua 的 author 规则被
+    #   替换语义吞掉了后面的部分。
+    #   → 若正则带捕获组，交给 apply_regex（替换 $1）；否则返回整段匹配。
+    if regex:
+        _pat = regex.partition('##')[0]
+        try:
+            if '##' not in _pat and '(' not in _pat:
+                mt = re.search(_pat, v)
+                return mt.group(0).strip() if mt else ''
+        except re.error:
+            pass
+    return apply_regex(v, regex)
+
+
 def eval_field(rule, html, base, subrules=None, binds=None, node=None):
     """跑一条非 JS 规则，返回单值。空值统一返回（空）。
 
@@ -609,6 +887,16 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
     ★ node 也可以是 **dict 条目**（JSONPath 容器场景），此时规则按其语义解释。
     """
     if not rule:
+        return ''
+    # ★ 2026-10-26 新增：Default 链式规则 `class.xxx@…@attr` 单独走
+    #   `_class_default_field`。早前把它夹在 eval_field 中段，因分支语义
+    #   互相干扰（取值后缀被当成属性过滤），一直取到空串。
+    if (node is None and rule.lstrip().startswith('class.')
+            and '@' in rule and '<js>' not in rule and '@js:' not in rule):
+        head, _, post = rule.strip().partition('##')
+        m2 = re.match(r'^(.*)@([A-Za-z][\w-]*)$', head)
+        if m2:
+            return _class_default_field(head, html, m2.group(2), post)
         return ''
     # ★ 条目是 dict（来自 `$.data.list` 这类 JSONPath 容器）：
     #   - `$.字段`  → 在该条目上跑 JSONPath
@@ -632,23 +920,63 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
         #   必须**先按 CSS 取到值**，再把该值作为 result 交给 <js> 处理。
         #   早期实现把整条规则直接丢给 JS 执行器 → 页面 HTML 根本不是 result，
         #   规则恒返回空，看着像选择器写错（实测：悠空网 author 整列为空）。
-        head = rule.split('<js>')[0]
-        code = rule.split('<js>', 1)[1].rsplit('</js>', 1)[0]
+        # ★ 规则里可能有**两段** <js>：`https://m.x.com<js>路径</js>@css:...@text<js>净化</js>`。
+        #   旧实现取「第一个 <js> 之前」当选择器、取「第一个 <js> 到最后一个 </js>」
+        #   当脚本，于是只有前缀地址（如 https://m.wxgbq.cc）被当选择器解析 →
+        #   SelectorSyntaxError、取值恒空。正确做法：先把非末段的 <js> 段当模板求值，
+        #   剩下最后一段才是后处理脚本。
+        _seg = rule.rsplit('<js>', 1)
+        head = _seg[0]
+        code = _seg[1].rsplit('</js>', 1)[0] if len(_seg) == 2 else ''
         if head:
-            if node is not None and (is_bare_suffix(head) or '<' not in head):
+            # ★ 带 URL 前缀（`https://m.x.com/path@css:...`）必须走「取另一页」分支，
+            #   不能被 '<' not in head 误判成条目内相对取值。
+            if (node is not None and '<' not in head
+                    and not re.match(r'^https?://', head.strip())):
+                cur = node_value(node, head)
+            elif node is not None and is_bare_suffix(head):
                 cur = node_value(node, head)
             else:
-                _sel, _attr, _re = strip_suffixes(head)
-                _vals = css(html, _sel, None if _attr == 'text' else _attr)
+                head_s = head.strip()
+                # 前缀里的 <js> 段（拼路径）先就地求值，与真机逐段求值一致
+                # ★ 求值前把 result/src/text 置空：保留 CSS 变量的话，js_eval 会走
+                #   「expression-replace」通路（把表达式替换进占位符后当 CSS 用），
+                #   拿到的是原值而非 JS 结果。
+                if '<js>' in head_s:
+                    _o, _l = M.run(head_s.split('<js>', 1)[1].split('</js>', 1)[0],
+                                   base, {}, dict(binds or {}, baseUrl=base,
+                                                  bookUrl=base, result='', src='', text=''))
+                    # ★ 用 rsplit 取「最后一个 <js> 之后」的尾巴；split('<js>')[0]
+                    #   会把后缀（@css:…@text）一起丢掉，导致只剩一个地址。
+                    _tail = head_s.rsplit('</js>', 1)[1] if '</js>' in head_s else ''
+                    head_s = head_s.split('<js>', 1)[0] + str(_o or '') + _tail
+                # ★ URL 前缀：Legado 允许规则写成「地址@css:…」，表示去那个
+                #   地址取值。原实现把整串当选择器 → SelectorSyntaxError、取值恒空。
+                #   切法：定位模式头（@css:/@xpath:/@json:），其前为地址。
+                src_html, src_base = html, base
+                head_s = head_s.replace('<js>', '').replace('</js>', '')
+                _p = head_s.find('@css:')
+                for _k in (head_s.find('@xpath:'), head_s.find('@json:')):
+                    if _k > 0 and (_p < 0 or _k < _p):
+                        _p = _k
+                if _p > 0:
+                    _addr = head_s[:_p].strip().rstrip('&').strip()
+                    if _addr.startswith('http'):
+                        src_html, _c = get(_addr)
+                        src_base = _addr
+                        head_s = head_s[_p:]
+                _sel, _attr, _re = strip_suffixes(head_s)
+                _vals = css(src_html, _sel, None if _attr == 'text' else _attr)
                 cur = _vals[0] if _vals else ''
                 if isinstance(cur, list):
                     cur = cur[0] if cur else ''
                 cur = apply_regex(cur if cur is not None else '', _re)
         else:
             cur = ''
-        out, _log = M.run(code if code.strip().startswith(('return', 'var')) else code,
-                          base, subrules or {}, dict(binds or {}, result=cur, src=cur))
-        return out if out is not None else ''
+        out, _log = M.run(code, base, subrules or {},
+                          dict(binds or {}, result=cur, src=cur, text=cur, __inner=cur))
+        out = out if out is not None else ''
+        return out
     if node is not None and (is_bare_suffix(rule) or is_bare_suffix(rule.split('##')[0])
                              or parse_tag_short(rule) or '<' not in rule):
         # 条目内相对取值：**只在该节点上求值**。
@@ -656,7 +984,40 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
         #   目录 1596 章 × 2 字段 = 3000+ 次全页解析，实测 194 秒并被 OOM 杀掉。
         #   节点上取不到就是空，这是正确语义（真机亦然）。
         return node_value(node, rule)
-    sel, attr, regex = strip_suffixes(rule)
+    # ★ 含多个 `@` 的 Default 链式规则（`class.x@img@src`）不能交给
+    #   strip_suffixes —— 它只认最后一个 `@`，会把倒数第二个 `@img` 当取值。
+    if rule.count('@') > 1 and '@css:' not in rule and '<js>' not in rule:
+        head, _, post = rule.partition('##')
+        m2 = re.match(r'^(.*)@([A-Za-z][\w-]*)$', head)
+        if m2:
+            sel, _a, _ = strip_suffixes(m2.group(1))
+            attr = m2.group(2)
+            regex = post
+    else:
+        sel, attr, regex = strip_suffixes(rule)
+    if sel == 'ERRCLASS':
+        return ''
+    # ★ 顶层（整页）的 `tag.x@attr` 简写：Legado Default 语义是「页面里第一个
+    #   <x>」。旧实现把 `tag.h1` 原样交给 soupsieve → 匹配 0 条（tag 不是标签名），
+    #   详情页书名整列为空（实测 uaamanhua）。
+    m_top = re.match(r'^tag\.([A-Za-z][\w-]*)(?:\.(-?\d+))?$', sel)
+    if m_top:
+        try:
+            soup_top = BeautifulSoup(html, 'html.parser')
+            found_top = soup_top.find_all(m_top.group(1))
+        except Exception:
+            found_top = []
+        if m_top.group(2) is not None:
+            idx_top = int(m_top.group(2))
+            found_top = [found_top[idx_top]] if abs(idx_top) <= len(found_top) else []
+        else:
+            found_top = found_top[:1]
+        if not found_top:
+            return ''
+        el_top = found_top[0]
+        v_top = (el_top.get_text(strip=True) if attr in ('text', 'textNodes', 'ownText')
+                 else (el_top.get(attr) or ''))
+        return apply_regex(v_top, regex)
     vals = css(html, sel, attr if attr in ('textNodes', 'ownText') else (None if attr == 'text' else attr))
     # ★ 真机语义：`sel@text` 命中多个元素时，Legado 会把它们的文本**全部拼接**
     #   （正文 `#nr1 p@text` 逐段取值即依赖此行为，38 段全都要）。
@@ -666,9 +1027,16 @@ def eval_field(rule, html, base, subrules=None, binds=None, node=None):
     if attr in ('text', 'textNodes', 'ownText'):
         v = '\n'.join(x for x in vals if isinstance(x, str) and x.strip())
     else:
-        v = vals[0] if vals else ''
-        if isinstance(v, list):
-            v = v[0] if v else ''
+        # ★ 属性取值同样是**多值**语义：图片型书源 `div.box img@src` 就是靠
+        #   它拿到整个章节的所有图。旧版只取 vals[0] → 60 张图只给 1 张，
+        #   把正确的图集规则误判成「非正文」。
+        clean = [x for x in vals if isinstance(x, str) and x.strip()]
+        if not clean:
+            v = ''
+        elif len(clean) == 1:
+            v = clean[0]
+        else:
+            v = '\n'.join(clean)
     return apply_regex(v if v is not None else '', regex)
 
 
@@ -1003,6 +1371,19 @@ def expand_host_vars(u, base='', item=None):
     #   以斜杠结尾的书籍页被剥成 `/5/5518` 会 404，看着像「目录规则写错」。
     u = u.replace('{{baseUrl}}', (base or SITE or ''))
     u = u.replace('{{bookUrl}}', base or '')
+    # ★ `<js>…</js>` 段在 Legado 里是逐段求值：它前面的部分只是「把值拼进来」。
+    #   脚本若整体当选择器送进 CSS 解析，就会出现「选择器 'https://m.xxx' 解析失败」。
+    #   这里把首段 <js> 就地求值（用 baseUrl 做宿主变量），与真机语义一致。
+    m_js = re.search(r'<js>([\s\S]*?)</js>', u)
+    if m_js:
+        try:
+            out, _log = M.run(m_js.group(1), base or SITE or '', {},
+                              {'baseUrl': base or SITE or '', 'bookUrl': base or ''})
+            if out is None:
+                out = ''
+            u = u[:m_js.start()] + str(out) + u[m_js.end():]
+        except Exception:
+            pass
     # ★ {{$.xxx}} —— 从「当前条目」的 JSON 取值插值（如 bookUrl: /book/{{$.id}}.html）
     if '{{$.' in u and item is not None:
         import re as _re
@@ -1012,7 +1393,7 @@ def expand_host_vars(u, base='', item=None):
             v = _jp_get(item, toks)
             return '' if v is None else str(v)
 
-        u = _re.sub(r'\{\{\$\.([\w.$\[\]]+)\}\}', _rep, u)
+        u = re.sub(r'\{\{\$\.([\w.$\[\]]+)\}\}', _rep, u)
     return u
 
 
@@ -1082,8 +1463,7 @@ def tab_explore(src, cat, page, url):
     if not (str(raw2).startswith('@js:') or '<js>' in str(raw2)):
         sel2, _a2, _r2 = strip_suffixes(raw2)
         try:
-            _s2 = BeautifulSoup(html, 'html.parser')
-            _e2 = _s2.select(sel2) if sel2.strip() else []
+            _e2 = css_nodes(html, sel2)
         except Exception as e:
             print('  ⚠ 解析异常：容器选择器失败（%s）｜%r' % (e.__class__.__name__, raw2))
             _e2 = []
@@ -1115,7 +1495,8 @@ def tab_info(src, book, url):
         sr = m.group(1)
         subr[sr] = eval_field(sr, html, bu)
         print('  过程 java.getString(%s) -> %r' % (sr, subr[sr]))
-    for f in ('name', 'author', 'kind', 'wordCount', 'intro', 'coverUrl', 'tocUrl'):
+    for f in ('name', 'author', 'kind', 'wordCount', 'intro', 'coverUrl',
+              'lastChapter', 'updateTime', 'tocUrl'):
         r = bi.get(f, '')
         if not r:
             continue
@@ -1289,14 +1670,23 @@ def tab_content(src, url):
             print('     反爬站常对错误路径返回广告页/空壳页，HTTP 200、长度正常，')
             print('     靠状态码与长度判成败必翻车；应改用「内容特征」判定。')
     else:
-        html, code = get(cu)
+        cu2 = cu
+        if '<js>' in cu:
+            cu2 = expand_host_vars(cu, cu)
+            print('  URL 求值后: %s' % cu2)
+        html, code = get(cu2)
         print('  响应 HTTP %s len=%d' % (code, len(html)))
-        v = eval_field(rc, html, cu)
+        v = eval_field(rc, html, cu2)
         print('  规则取值长度=%d' % len(str(v)))
         _ok, _why = is_real_content(str(v))
         if not _ok:
             print('  判定=✗ %s' % _why)
             classify_content(str(v), code)
+        else:
+            print('  判定=✓ 正文（%s）' % _why)
+        s = str(v)
+        print('      首段: %s' % s[:44].strip())
+        print('      末段: %s' % s[-44:].strip())
 
 
 def main():
